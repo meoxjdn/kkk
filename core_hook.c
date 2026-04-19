@@ -29,7 +29,6 @@
 #define SHADOW_BRK_IMM   0x5A5AU
 #define SHADOW_BRK_INSN  (0xD4200000U | (SHADOW_BRK_IMM << 5))
 
-/* 统一设定为 unsigned long，免疫 GKI 碎片化 */
 typedef unsigned long hook_esr_t;
 
 void (*x_register_user_step_hook)(struct step_hook *hook);
@@ -86,7 +85,7 @@ struct shadow_entry {
     spinlock_t       entry_lock;
     u32              custom_rot[3];
     int              is_rot_hook;
-    unsigned long    jump_vaddr; /* 【新增】跳跃目标 */
+    unsigned long    jump_vaddr;
 };
 
 LIST_HEAD(shadow_page_list);
@@ -107,9 +106,7 @@ static int shadow_break_handler(struct pt_regs *regs, hook_esr_t esr)
 
         spin_lock(&entry->entry_lock);
         switch (entry->is_rot_hook) {
-        case 0:
-            regs->regs[8] = 0;
-            break;
+        case 0: regs->regs[8] = 0; break;
         case 1: {
             u32 new_rot[3] = { entry->custom_rot[0], entry->custom_rot[1], entry->custom_rot[2] };
             if (!(new_rot[0] == 0 && new_rot[1] == 0 && new_rot[2] == 0)) {
@@ -122,7 +119,6 @@ static int shadow_break_handler(struct pt_regs *regs, hook_esr_t esr)
                 ((u32 *)&new_fp_state.vregs[5])[0] = new_rot[2];
                 if (x_fpsimd_update_current_state) x_fpsimd_update_current_state(&new_fp_state);
                 preempt_enable();
-                
                 if (copy_to_user((void __user *)regs->sp, new_rot, sizeof(new_rot))) {}
             }
             break;
@@ -134,20 +130,18 @@ static int shadow_break_handler(struct pt_regs *regs, hook_esr_t esr)
             spin_unlock_irqrestore(&shadow_page_lock, flags);
             return DBG_HOOK_HANDLED;
         
-        /* 【核心】无痕跳转逻辑 (PC Hijacking) */
+        /* 无痕跳转 PC Hijacking */
         case 3:
             regs->pc = entry->jump_vaddr;
             spin_unlock(&entry->entry_lock);
             spin_unlock_irqrestore(&shadow_page_lock, flags);
             return DBG_HOOK_HANDLED;
 
-        default:
-            break;
+        default: break;
         }
         spin_unlock(&entry->entry_lock);
         spin_unlock_irqrestore(&shadow_page_lock, flags);
 
-        /* 单步恢复准备 */
         if (patch_insn_current(entry->target_vaddr, entry->orig_insn) == 0) {
             atomic_set(&entry->step_pending, 1);
             if (x_user_enable_single_step) x_user_enable_single_step(current);
@@ -221,7 +215,7 @@ int add_shadow(struct shadow_request *req)
     entry->mm = mm; entry->pid = req->pid; entry->orig_insn = orig_insn;
     entry->custom_rot[0] = req->custom_rot[0]; entry->custom_rot[1] = req->custom_rot[1]; entry->custom_rot[2] = req->custom_rot[2];
     entry->is_rot_hook = req->is_rot_hook;
-    entry->jump_vaddr = req->jump_vaddr; /* 传递目标地址 */
+    entry->jump_vaddr = req->jump_vaddr;
     
     atomic_set(&entry->step_pending, 0); spin_lock_init(&entry->entry_lock);
 
@@ -233,44 +227,43 @@ int add_shadow(struct shadow_request *req)
     return 0;
 }
 
-int update_shadow_rot(struct shadow_request *req)
-{
-    /* 略，保持原有逻辑 */
-    return 0; 
-}
+int update_shadow_rot(struct shadow_request *req) { return 0; }
 
-int del_shadow(struct shadow_request *req)
+int del_shadow(struct shadow_request *req) { return 0; }
+
+/* 核爆级防泄漏内存释放池 */
+void clear_all_shadows(void)
 {
     struct shadow_entry *entry, *tmp;
     unsigned long flags;
+
     spin_lock_irqsave(&shadow_page_lock, flags);
     list_for_each_entry_safe(entry, tmp, &shadow_page_list, list) {
-        if (entry->pid != req->pid || entry->vaddr != (req->vaddr & PAGE_MASK)) continue;
         list_del(&entry->list);
         spin_unlock_irqrestore(&shadow_page_lock, flags);
 
         {
             struct task_struct *task;
             rcu_read_lock();
-            task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
+            task = pid_task(find_vpid(entry->pid), PIDTYPE_PID);
             if (task) get_task_struct(task);
             rcu_read_unlock();
+            
             if (task) {
                 patch_insn_user(task, entry->target_vaddr, entry->orig_insn, NULL, true);
                 put_task_struct(task);
             }
         }
-        mmput(entry->mm); kfree(entry);
-        return 0;
+        if (entry->mm) mmput(entry->mm);
+        kfree(entry);
+        spin_lock_irqsave(&shadow_page_lock, flags);
     }
     spin_unlock_irqrestore(&shadow_page_lock, flags);
-    return -ENOENT;
 }
 
 int shadow_fault_init_dynamic(struct shadow_sym_request *syms)
 {
     if (!syms || !syms->p_register_user_break_hook) return -EINVAL;
-
     x_register_user_step_hook = (void *)syms->p_register_user_step_hook;
     x_unregister_user_step_hook = (void *)syms->p_unregister_user_step_hook;
     x_user_enable_single_step = (void *)syms->p_user_enable_single_step;
@@ -279,12 +272,10 @@ int shadow_fault_init_dynamic(struct shadow_sym_request *syms)
     x_fpsimd_update_current_state = (void *)syms->p_fpsimd_update_current_state;
     x_register_user_break_hook = (reg_break_hook_fn_t)syms->p_register_user_break_hook;
     x_unregister_user_break_hook = (reg_break_hook_fn_t)syms->p_unregister_user_break_hook;
-
     if (!x_register_user_break_hook) return -ENOENT;
     
     x_register_user_break_hook(&shadow_break_hook);
     if (x_register_user_step_hook) x_register_user_step_hook(&shadow_step_hook);
-
     return 0;
 }
 
@@ -292,4 +283,5 @@ void shadow_fault_exit(void)
 {
     if (x_unregister_user_step_hook) x_unregister_user_step_hook(&shadow_step_hook);
     if (x_unregister_user_break_hook) x_unregister_user_break_hook(&shadow_break_hook);
+    clear_all_shadows();
 }
