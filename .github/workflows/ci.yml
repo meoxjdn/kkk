@@ -14,8 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         kmi:
-          - android11-5.4
-          - android12-5.4
+          # 剔除了云端缺乏镜像支持的 5.4 版本，保留稳定支持的 GKI 矩阵
           - android12-5.10
           - android13-5.10
           - android13-5.15
