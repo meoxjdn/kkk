@@ -29,7 +29,8 @@
 #define SHADOW_BRK_IMM   0x5A5AU
 #define SHADOW_BRK_INSN  (0xD4200000U | (SHADOW_BRK_IMM << 5))
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+/* 核心修复点：将 esr 数据类型升级的分水岭修改为 5.14.0 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
 typedef unsigned long hook_esr_t;
 #else
 typedef unsigned int  hook_esr_t;
@@ -142,7 +143,6 @@ static int shadow_break_handler(struct pt_regs *regs, hook_esr_t esr)
                 if (x_fpsimd_update_current_state) x_fpsimd_update_current_state(&new_fp_state);
                 preempt_enable();
                 
-                /* 修复点：捕获 copy_to_user 的返回值，消除编译错误 */
                 if (copy_to_user((void __user *)regs->sp, new_rot, sizeof(new_rot))) {
                     pr_err_ratelimited("[hook_core] case1 copy_to_user failed at sp=0x%llx\n", (unsigned long long)regs->sp);
                 }
