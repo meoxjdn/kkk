@@ -3,20 +3,31 @@
 
 #include <linux/types.h>
 
-/* ARM64 调试钩子返回值规范 */
 #define DBG_HOOK_HANDLED 0
 #define DBG_HOOK_ERROR   1
 
-/* 对应内核空间的业务请求结构体 (用于下发 il2cpp 偏移等) */
+/* 驱动通信协议 IOCTL 魔法字 */
+#define WUWA_IOCTL_ADD_SHADOW _IOW('W', 1, struct shadow_request)
+#define WUWA_IOCTL_RAW_PATCH  _IOW('W', 2, struct raw_patch_req)
+
+/* BRK 硬件断点劫持请求包 */
 struct shadow_request {
     pid_t pid;
     unsigned long vaddr;
     unsigned long target_vaddr;
     u32 custom_rot[3];
     int is_rot_hook;
+    unsigned long jump_vaddr; /* 【新增】极客流无痕跳转目标地址 */
 };
 
-/* 用于接收从 loader.sh 动态下发的内核符号绝对地址 */
+/* 强力穿透写入请求包 */
+struct raw_patch_req {
+    pid_t pid;
+    uint64_t addr;
+    uint32_t data;
+};
+
+/* 动态基址投喂请求包 */
 struct shadow_sym_request {
     unsigned long p_register_user_step_hook;
     unsigned long p_unregister_user_step_hook;
@@ -28,7 +39,6 @@ struct shadow_sym_request {
     unsigned long p_unregister_user_break_hook;
 };
 
-/* 核心导出函数声明 */
 extern int shadow_fault_init_dynamic(struct shadow_sym_request *syms);
 extern void shadow_fault_exit(void);
 extern int add_shadow(struct shadow_request *req);
