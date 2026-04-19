@@ -5,18 +5,17 @@ on:
     branches:
       - main
       - master
-  # 允许你在 GitHub Actions 页面手动点击 Run workflow 触发
   workflow_dispatch:
 
 jobs:
   matrix-builder:
-    # 引用同一目录下的 ddk-lkm.yml 执行器
     uses: ./.github/workflows/ddk-lkm.yml
     strategy:
-      # fail-fast 设为 false：某一个版本编译失败，不会中断其他版本的编译
       fail-fast: false
       matrix:
         kmi:
+          - android11-5.4
+          - android12-5.4
           - android12-5.10
           - android13-5.10
           - android13-5.15
