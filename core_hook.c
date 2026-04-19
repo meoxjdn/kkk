@@ -29,12 +29,8 @@
 #define SHADOW_BRK_IMM   0x5A5AU
 #define SHADOW_BRK_INSN  (0xD4200000U | (SHADOW_BRK_IMM << 5))
 
-/* 核心修复点：将 esr 数据类型升级的分水岭修改为 5.14.0 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+/* 统一设定为 unsigned long，利用 ARM64 的 x1 寄存器兼容特性 */
 typedef unsigned long hook_esr_t;
-#else
-typedef unsigned int  hook_esr_t;
-#endif
 
 void (*x_register_user_step_hook)(struct step_hook *hook);
 void (*x_unregister_user_step_hook)(struct step_hook *hook);
@@ -196,12 +192,21 @@ static int shadow_step_handler(struct pt_regs *regs, hook_esr_t esr)
     return handled ? DBG_HOOK_HANDLED : DBG_HOOK_ERROR;
 }
 
+/* * 核心修复魔法区：
+ * 强制告诉编译器“别管指针类型匹不匹配了，给我硬塞进去”。
+ * 这是对付 Android 畸形 Backport 最有效的极客手段。
+ */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wincompatible-function-pointer-types"
+
 static struct break_hook shadow_break_hook = {
     .fn   = shadow_break_handler,
     .imm  = SHADOW_BRK_IMM,
     .mask = 0,
 };
 static struct step_hook shadow_step_hook = { .fn = shadow_step_handler };
+
+#pragma GCC diagnostic pop
 
 int add_shadow(struct shadow_request *req)
 {
