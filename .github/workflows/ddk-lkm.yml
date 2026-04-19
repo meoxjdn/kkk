@@ -1,0 +1,55 @@
+name: DDK Build Kernel Module
+
+on:
+  workflow_call:
+    inputs:
+      kmi:
+        description: 'KMI version (e.g., android14-6.1)'
+        required: true
+        type: string
+      ddk_release:
+        description: 'DDK container release tag'
+        required: false
+        default: '20251016'
+        type: string
+      module_name:
+        description: 'Kernel module name (without .ko)'
+        required: false
+        default: 'android-wuwa'
+        type: string
+
+jobs:
+  build-module:
+    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
+    runs-on: ubuntu-latest
+    container:
+      # 拉取指定版本的 Android GKI 编译环境
+      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+
+    - name: Compile Kernel Module
+      run: |
+        echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
+        
+        # 这里的 KDIR 将被传递给你的 Makefile
+        make KDIR=$KERNEL_SRC
+        
+        # 创建输出目录
+        mkdir -p /github/workspace/out
+        
+        # 以 KMI 版本重命名文件，防止产物冲突
+        OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
+        cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
+
+        echo "=== Stripping debug symbols to reduce size ==="
+        llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.module_name }}-${{ inputs.kmi }}.ko
+        path: /github/workspace/out/${{ inputs.module_name }}-${{ inputs.kmi }}.ko
