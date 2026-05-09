@@ -1,11 +1,11 @@
 #
-# Ghost Core V10.5 Build System
+# Ghost Core V10.21 Build System (Monolithic)
 #
 
-MODULE_NAME := android-wuwa
+MODULE_NAME := android15-6.6-release
 
 obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-objs := main.o core_hook.o dynamic_resolver.o
+$(MODULE_NAME)-objs := core.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
