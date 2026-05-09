@@ -860,7 +860,7 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 
 int ghost_core_init_engine(void)
 {
-    uint32_t random_offset;
+    
 
     if (ghost_resolver_init() < 0) return -EINVAL;
 
