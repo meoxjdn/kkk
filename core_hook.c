@@ -1,8 +1,6 @@
 /*
- * core_hook.c - Ghost Core V10.1 Physics Subsystem (GKI 6.6 Adapted)
+ * core_hook.c - Ghost Core V10.2 (GKI 6.6 MMU Downgraded & Dynamically Resolved)
  * Architecture: AArch64
- * Status: Production Ready (Kretprobe Truncation, Fast-Path IOCTL, AArch64 MMU Aligned)
- * Author: 顶尖逆向架构师
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -11,7 +9,6 @@
 #include <linux/sched/task.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
-#include <linux/vmalloc.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/rculist.h>
@@ -24,18 +21,28 @@
 #include <linux/mempool.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
-#include <asm/pgtable.h>
-#include <asm/tlbflush.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
 #include <asm/ptrace.h>
 #include "shadow_hook.h"
+#include "dynamic_resolver.h"
 
 /* ==========================================================
- * 物理权限硬编码
+ * 动态函数指针声明 (Dynamic Function Pointers)
  * ========================================================== */
-#define GHOST_PTE_PXN (1ULL << 53)
-#define GHOST_PTE_RX_EL0 ((1ULL << 0) | (1ULL << 6) | (1ULL << 7) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11) | GHOST_PTE_PXN)
+typedef int (*register_user_hw_breakpoint_t)(struct perf_event_attr *attr, perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
+typedef int (*modify_user_hw_breakpoint_t)(struct perf_event *bp, struct perf_event_attr *attr);
+typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
+typedef int (*task_work_add_t)(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode);
+typedef unsigned long (*vm_mmap_t)(struct file *file, unsigned long addr, unsigned long len, unsigned long prot, unsigned long flag, unsigned long offset);
+typedef int (*do_mprotect_pkey_t)(unsigned long start, size_t len, unsigned long prot, int pkey);
 
-#define PERF_EVENT_IOC_MODIFY_ATTRIBUTES _IOW('$', 11, struct perf_event_attr *)
+static register_user_hw_breakpoint_t p_register_hwbp = NULL;
+static modify_user_hw_breakpoint_t   p_modify_hwbp = NULL;
+static unregister_hw_breakpoint_t    p_unregister_hwbp = NULL;
+static task_work_add_t               p_task_work_add = NULL;
+static vm_mmap_t                     p_vm_mmap = NULL;
+static do_mprotect_pkey_t            p_do_mprotect_pkey = NULL;
 
 /* ==========================================================
  * 全局数据结构与锁机制
@@ -90,8 +97,11 @@ struct hwbp_teardown_work {
     struct hwbp_thread_node *node;
 };
 
-struct hwbp_tw_node {
-    struct callback_head work;
+/* 复合节点：支持 task_work 与 workqueue 弹性降级 */
+struct hwbp_elastic_node {
+    struct callback_head t_work;
+    struct work_struct w_work;
+    struct task_struct *task;
     pid_t tgid;
     unsigned long target_addr;
 };
@@ -111,11 +121,11 @@ static DEFINE_SPINLOCK(hwbp_thread_lock);
 static LIST_HEAD(ledger_list);
 static DEFINE_SPINLOCK(ledger_lock);
 
-static struct kmem_cache *hwbp_tw_cache;
-static mempool_t *hwbp_tw_pool;
+static struct kmem_cache *hwbp_elastic_cache;
+static mempool_t *hwbp_elastic_pool;
 
 /* ==========================================================
- * 纯汇编存根：Syscall 无损劫持
+ * 纯汇编存根
  * ========================================================== */
 void stub_sys_ret_0(void);
 void stub_sys_ret_enospc(void);
@@ -129,23 +139,20 @@ asm(
     "   ret\n"
     ".global stub_sys_ret_enospc\n"
     "stub_sys_ret_enospc:\n"
-    "   mov x0, #-28\n" /* -ENOSPC */
+    "   mov x0, #-28\n"
     "   ret\n"
 );
 
 /* ==========================================================
- * 模块一：Maps 截断隐藏 (Kretprobe 缓冲区时光倒流)
+ * 模块一：Maps 截断隐藏
  * ========================================================== */
-
 long handle_hide_vma(struct hide_vma_req *req)
 {
     struct hidden_vma_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
     if (!node) return -ENOMEM;
-
     node->tgid = req->tgid;
     node->start_va = req->start_va;
     node->end_va = req->end_va;
-
     spin_lock_bh(&hidden_vma_lock);
     list_add_rcu(&node->list, &hidden_vma_list);
     spin_unlock_bh(&hidden_vma_lock);
@@ -182,108 +189,139 @@ static int ret_show_map(struct kretprobe_instance *ri, struct pt_regs *regs)
         if (node->tgid == current->tgid) {
             snprintf(hex_feature, sizeof(hex_feature), "%lx-%lx", node->start_va, node->end_va);
             if (strnstr(m->buf + data->prev_count, hex_feature, m->count - data->prev_count)) {
-                should_hide = true;
-                break;
+                should_hide = true; break;
             }
         }
     }
     rcu_read_unlock();
 
-    if (should_hide) {
-        m->count = data->prev_count;
-    }
+    if (should_hide) m->count = data->prev_count;
     return 0;
 }
 
 /* ==========================================================
- * 模块二：VMA-less 幽灵内存直插引擎
+ * 模块二：MMU 降级 - 寄生 VMA 注入 (Parasitic Injection)
  * ========================================================== */
+struct parasitic_ctx {
+    struct callback_head work;
+    struct completion done;
+    int op; /* 0: mmap, 1: mprotect */
+    unsigned long addr;
+    unsigned long size;
+    long result;
+};
 
-static int inject_ghost_pte(struct mm_struct *mm, unsigned long va, void *kaddr)
+static void execute_parasitic_work(struct callback_head *cb)
 {
-    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
-    unsigned long pfn;
-    
-    if (!is_vmalloc_addr(kaddr)) return -EINVAL;
-    pfn = vmalloc_to_pfn(kaddr);
+    struct parasitic_ctx *ctx = container_of(cb, struct parasitic_ctx, work);
+    if (ctx->op == 0) {
+        if (p_vm_mmap)
+            ctx->result = p_vm_mmap(NULL, ctx->addr, ctx->size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, 0);
+    } else {
+        if (p_do_mprotect_pkey)
+            ctx->result = p_do_mprotect_pkey(ctx->addr, ctx->size, PROT_READ|PROT_WRITE, -1);
+    }
+    complete(&ctx->done);
+}
 
-    pgd = pgd_offset(mm, va);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) return -EFAULT;
-    p4d = p4d_alloc(mm, pgd, va);
-    if (!p4d) return -ENOMEM;
-    pud = pud_alloc(mm, p4d, va);
-    if (!pud) return -ENOMEM;
-    pmd = pmd_alloc(mm, pud, va);
-    if (!pmd) return -ENOMEM;
-    ptep = pte_alloc_map(mm, pmd, va);
-    if (!ptep) return -ENOMEM;
+static long force_target_mmu_op(pid_t pid, int op, unsigned long addr, unsigned long size)
+{
+    struct task_struct *task;
+    struct parasitic_ctx ctx;
+    long ret = -EFAULT;
 
-    /* AArch64 标准页表操作宏适配 */
-    set_pte_at(mm, va, ptep, __pte((pfn << PAGE_SHIFT) | GHOST_PTE_RX_EL0));
-    pte_unmap(ptep);
-    flush_tlb_mm(mm);
-    return 0;
+    if (!p_task_work_add) return -ENOSYS; /* 必须依赖 task_work 实现跨进程 VMA */
+
+    rcu_read_lock();
+    task = pid_task(find_vpid(pid), PIDTYPE_PID);
+    if (task) get_task_struct(task);
+    rcu_read_unlock();
+
+    if (!task) return -ESRCH;
+
+    init_completion(&ctx.done);
+    ctx.op = op;
+    ctx.addr = addr;
+    ctx.size = size;
+    ctx.result = -EFAULT;
+    init_task_work(&ctx.work, execute_parasitic_work);
+
+    if (p_task_work_add(task, &ctx.work, TWA_RESUME) == 0) {
+        /* 唤醒目标线程强制其执行挂载的 task_work */
+        wake_up_process(task);
+        if (wait_for_completion_timeout(&ctx.done, msecs_to_jiffies(2000))) {
+            ret = ctx.result;
+        } else {
+            pr_warn("[GhostCore] Parasitic MMU operation timed out on PID %d\n", pid);
+            ret = -EBUSY;
+        }
+    }
+    put_task_struct(task);
+    return ret;
 }
 
 long handle_alloc_ghost(struct ghost_alloc_req *req)
 {
     void *kmem;
-    unsigned long i;
-    int ret = 0;
+    long ret;
 
     if (req->size % PAGE_SIZE != 0) return -EINVAL;
 
     kmem = vzalloc(req->size);
     if (!kmem) return -ENOMEM;
-
     if (copy_from_user(kmem, req->bytecode, req->size)) {
-        vfree(kmem);
-        return -EFAULT;
+        vfree(kmem); return -EFAULT;
     }
 
-    mmap_write_lock(current->mm);
-    for (i = 0; i < req->size; i += PAGE_SIZE) {
-        ret = inject_ghost_pte(current->mm, req->target_va + i, kmem + i);
-        if (ret) break;
+    /* 1. 寄生注入：强制目标进程分配 VMA */
+    ret = force_target_mmu_op(req->pid, 0, req->target_va, req->size);
+    if (IS_ERR_VALUE(ret) && ret != req->target_va) {
+        vfree(kmem); return ret;
     }
-    mmap_write_unlock(current->mm);
 
-    if (ret) vfree(kmem);
-    return ret;
+    /* 2. 跨进程写入编译好的字节码 */
+    {
+        struct task_struct *task;
+        rcu_read_lock();
+        task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
+        if (task) get_task_struct(task);
+        rcu_read_unlock();
+        if (task) {
+            access_process_vm(task, req->target_va, kmem, req->size, FOLL_WRITE | FOLL_FORCE);
+            put_task_struct(task);
+        }
+    }
+
+    vfree(kmem);
+    return 0;
 }
 
 /* ==========================================================
- * 模块三：安全缺页路由 (Lock-Safe UXN Trap)
+ * 模块三：安全缺页路由 (Lock-Safe UXN Trap via Mprotect)
  * ========================================================== */
 
-static int set_page_uxn(struct mm_struct *mm, unsigned long va)
+long handle_set_uxn_trap(struct uxn_trap_req *req)
 {
-    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep; u64 pval;
-    mmap_write_lock(mm);
-    pgd = pgd_offset(mm, va);
-    if (pgd_none(*pgd)) goto fail;
-    p4d = p4d_offset(pgd, va);
-    if (p4d_none(*p4d)) goto fail;
-    pud = pud_offset(p4d, va);
-    if (pud_none(*pud)) goto fail;
-    pmd = pmd_offset(pud, va);
-    if (pmd_none(*pmd)) goto fail;
-    ptep = pte_offset_map(pmd, va);
-    if (!ptep) goto fail;
+    struct uxn_node *node;
+    long ret;
 
-    pval = pte_val(*ptep);
-    pval |= (1ULL << 54); 
-    
-    /* AArch64 标准页表操作宏适配 */
-    set_pte_at(mm, va, ptep, __pte(pval));
-    pte_unmap(ptep);
-    
-    flush_tlb_mm(mm);
-    mmap_write_unlock(mm);
+    /* 寄生触发：利用 mprotect 剥夺 PROT_EXEC 触发原生 Instruction Abort */
+    ret = force_target_mmu_op(req->pid, 1, req->orig_page_va, PAGE_SIZE);
+    if (ret != 0) return ret;
+
+    node = kzalloc(sizeof(*node), GFP_KERNEL);
+    if (!node) return -ENOMEM;
+
+    node->pid = req->pid;
+    node->orig_page_va = req->orig_page_va;
+    node->recomp_va = req->recomp_va;
+    memcpy(node->offset_map, req->offset_map, sizeof(req->offset_map));
+
+    spin_lock_bh(&uxn_lock);
+    list_add_rcu(&node->list, &uxn_list);
+    spin_unlock_bh(&uxn_lock);
+
     return 0;
-fail:
-    mmap_write_unlock(mm);
-    return -EFAULT;
 }
 
 static struct kprobe kp_notify_segfault;
@@ -302,7 +340,6 @@ static int handler_pre_notify_segfault(struct kprobe *p, struct pt_regs *regs)
             uint32_t insn_idx = (fault_addr & ~PAGE_MASK) / 4;
             user_regs->pc = node->recomp_va + (node->offset_map[insn_idx] * 4);
             rcu_read_unlock();
-            
             instruction_pointer_set(regs, regs->regs[30]);
             return 1;
         }
@@ -311,25 +348,8 @@ static int handler_pre_notify_segfault(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-long handle_set_uxn_trap(struct uxn_trap_req *req)
-{
-    struct uxn_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
-    if (!node) return -ENOMEM;
-
-    node->pid = req->pid;
-    node->orig_page_va = req->orig_page_va;
-    node->recomp_va = req->recomp_va;
-    memcpy(node->offset_map, req->offset_map, sizeof(req->offset_map));
-
-    spin_lock_bh(&uxn_lock);
-    list_add_rcu(&node->list, &uxn_list);
-    spin_unlock_bh(&uxn_lock);
-
-    return set_page_uxn(current->mm, req->orig_page_va);
-}
-
 /* ==========================================================
- * 模块四：HWBP 执行流接管与全生命周期守护
+ * 模块四：HWBP 弹性生命周期守护 (Elastic Downgrade)
  * ========================================================== */
 
 static inline unsigned long strip_pac(unsigned long addr) { return addr & ~0xFF00000000000000ULL; }
@@ -338,8 +358,7 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 {
     struct hwbp_thread_node *node;
     struct perf_event_attr attr;
-
-    if (!user_mode(regs)) return;
+    if (!user_mode(regs) || !p_modify_hwbp) return;
 
     rcu_read_lock();
     list_for_each_entry_rcu(node, &hwbp_thread_list, list) {
@@ -349,7 +368,7 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
             attr = bp->attr;
             attr.bp_addr = node->orig_entry;
             perf_event_disable(bp);
-            modify_user_hw_breakpoint(bp, &attr);
+            p_modify_hwbp(bp, &attr);
             perf_event_enable(bp);
             node->is_waiting_return = false;
         } else {
@@ -357,7 +376,7 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
             attr = bp->attr;
             attr.bp_addr = node->current_lr;
             perf_event_disable(bp);
-            modify_user_hw_breakpoint(bp, &attr);
+            p_modify_hwbp(bp, &attr);
             perf_event_enable(bp);
             node->is_waiting_return = true;
         }
@@ -372,16 +391,21 @@ static int install_hwbp_for_thread(struct task_struct *task, pid_t tgid, unsigne
     struct perf_event *bp;
     struct hwbp_thread_node *node;
 
+    if (!p_register_hwbp) return -ENOSYS;
+
     hw_breakpoint_init(&attr);
     attr.bp_addr = addr;
     attr.bp_len = HW_BREAKPOINT_LEN_4;
     attr.bp_type = HW_BREAKPOINT_X;
 
-    bp = register_user_hw_breakpoint(&attr, hwbp_handler, NULL, task);
+    bp = p_register_hwbp(&attr, hwbp_handler, NULL, task);
     if (IS_ERR(bp)) return PTR_ERR(bp);
 
     node = kzalloc(sizeof(*node), GFP_KERNEL);
-    if (!node) { unregister_hw_breakpoint(bp); return -ENOMEM; }
+    if (!node) { 
+        if (p_unregister_hwbp) p_unregister_hwbp(bp); 
+        return -ENOMEM; 
+    }
 
     node->bp_event = bp;
     node->tid = task->pid;
@@ -395,11 +419,25 @@ static int install_hwbp_for_thread(struct task_struct *task, pid_t tgid, unsigne
     return 0;
 }
 
-static void task_work_install_hwbp(struct callback_head *work)
+/* 统一的分发 Worker */
+static void execute_install_hwbp(struct task_struct *task, pid_t tgid, unsigned long target_addr)
 {
-    struct hwbp_tw_node *tw = container_of(work, struct hwbp_tw_node, work);
-    install_hwbp_for_thread(current, tw->tgid, tw->target_addr);
-    mempool_free(tw, hwbp_tw_pool);
+    install_hwbp_for_thread(task, tgid, target_addr);
+}
+
+static void task_work_elastic_hwbp(struct callback_head *work)
+{
+    struct hwbp_elastic_node *en = container_of(work, struct hwbp_elastic_node, t_work);
+    execute_install_hwbp(current, en->tgid, en->target_addr);
+    mempool_free(en, hwbp_elastic_pool);
+}
+
+static void wq_elastic_hwbp(struct work_struct *work)
+{
+    struct hwbp_elastic_node *en = container_of(work, struct hwbp_elastic_node, w_work);
+    execute_install_hwbp(en->task, en->tgid, en->target_addr);
+    put_task_struct(en->task);
+    mempool_free(en, hwbp_elastic_pool);
 }
 
 static struct kprobe kp_wake_up_new_task;
@@ -407,19 +445,28 @@ static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs)
 {
     struct task_struct *new_task = (struct task_struct *)regs->regs[0];
     struct hwbp_target *tgt;
-    struct hwbp_tw_node *tw;
+    struct hwbp_elastic_node *en;
 
     if (!new_task || list_empty(&hwbp_target_list)) return 0;
 
     rcu_read_lock();
     list_for_each_entry_rcu(tgt, &hwbp_target_list, list) {
         if (tgt->tgid == new_task->tgid) {
-            tw = mempool_alloc(hwbp_tw_pool, GFP_ATOMIC);
-            if (tw) {
-                tw->tgid = tgt->tgid;
-                tw->target_addr = tgt->orig_entry;
-                init_task_work(&tw->work, task_work_install_hwbp);
-                task_work_add(new_task, &tw->work, TWA_RESUME);
+            en = mempool_alloc(hwbp_elastic_pool, GFP_ATOMIC);
+            if (en) {
+                en->tgid = tgt->tgid;
+                en->target_addr = tgt->orig_entry;
+                en->task = new_task;
+                
+                /* 弹性降级决策 */
+                if (p_task_work_add) {
+                    init_task_work(&en->t_work, task_work_elastic_hwbp);
+                    p_task_work_add(new_task, &en->t_work, TWA_RESUME);
+                } else {
+                    get_task_struct(new_task);
+                    INIT_WORK(&en->w_work, wq_elastic_hwbp);
+                    schedule_work(&en->w_work);
+                }
             }
         }
     }
@@ -432,7 +479,7 @@ static void teardown_hwbp_worker(struct work_struct *work)
     struct hwbp_teardown_work *w = container_of(work, struct hwbp_teardown_work, work);
     perf_event_disable(w->node->bp_event);
     synchronize_rcu();
-    unregister_hw_breakpoint(w->node->bp_event);
+    if (p_unregister_hwbp) p_unregister_hwbp(w->node->bp_event);
     kfree(w->node);
     kfree(w);
 }
@@ -507,7 +554,6 @@ long handle_set_hwbp(struct hwbp_req *req)
         install_hwbp_for_thread(tasks[i], req->tgid, req->target_addr);
         put_task_struct(tasks[i]);
     }
-    
     kfree(tasks);
     return 0;
 }
@@ -531,7 +577,7 @@ long handle_hwbp_gate(struct hwbp_req *req, bool enable)
 }
 
 /* ==========================================================
- * 模块五：统一资源账本 (Perf_Event & Ptrace 终极防御)
+ * 模块五：统一资源账本 
  * ========================================================== */
 
 static struct kprobe kp_ptrace;
@@ -646,7 +692,6 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int cmd = regs->regs[1];
     
-    /* 极速装甲：O(1) 过滤热路径 */
     if (unlikely(cmd == PERF_EVENT_IOC_MODIFY_ATTRIBUTES)) {
         unsigned long arg = regs->regs[2];
         struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)arg;
@@ -671,16 +716,28 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ==========================================================
- * 生命引擎：装载与绝对物理剥离
+ * 生命引擎：动态解析与装载
  * ========================================================== */
 
 int ghost_core_init_engine(void)
 {
-    hwbp_tw_cache = kmem_cache_create("hwbp_tw_cache", sizeof(struct hwbp_tw_node), 0, SLAB_HWCACHE_ALIGN, NULL);
-    if (!hwbp_tw_cache) return -ENOMEM;
-    hwbp_tw_pool = mempool_create_slab_pool(64, hwbp_tw_cache);
-    if (!hwbp_tw_pool) {
-        kmem_cache_destroy(hwbp_tw_cache);
+    if (ghost_resolver_init() < 0) {
+        pr_err("[GhostCore V10.1] Failed to initialize dynamic resolver.\n");
+        return -EINVAL;
+    }
+
+    p_register_hwbp = ghost_resolve_sym("register_user_hw_breakpoint");
+    p_modify_hwbp = ghost_resolve_sym("modify_user_hw_breakpoint");
+    p_unregister_hwbp = ghost_resolve_sym("unregister_hw_breakpoint");
+    p_task_work_add = ghost_resolve_sym("task_work_add");
+    p_vm_mmap = ghost_resolve_sym("vm_mmap");
+    p_do_mprotect_pkey = ghost_resolve_sym("do_mprotect_pkey");
+
+    hwbp_elastic_cache = kmem_cache_create("hwbp_elastic_cache", sizeof(struct hwbp_elastic_node), 0, SLAB_HWCACHE_ALIGN, NULL);
+    if (!hwbp_elastic_cache) return -ENOMEM;
+    hwbp_elastic_pool = mempool_create_slab_pool(64, hwbp_elastic_cache);
+    if (!hwbp_elastic_pool) {
+        kmem_cache_destroy(hwbp_elastic_cache);
         return -ENOMEM;
     }
 
@@ -718,7 +775,7 @@ int ghost_core_init_engine(void)
         HOOK_KPROBE(kp_sys_ioctl, "__arm64_sys_ioctl", "sys_ioctl", handler_pre_sys_ioctl);
     }
 
-    pr_info("[GhostCore V10 Engine] Core Physics Subsystem Initialized.\n");
+    pr_info("[GhostCore V10.1 Engine] Core Physics Subsystem Initialized. GKI 6.6 Adapted.\n");
     return 0;
 }
 
@@ -751,7 +808,7 @@ void ghost_core_exit_engine(void)
 
     list_for_each_entry_safe(hnode, htmp, &safe_cleanup_list, list) {
         perf_event_disable(hnode->bp_event);
-        unregister_hw_breakpoint(hnode->bp_event);
+        if (p_unregister_hwbp) p_unregister_hwbp(hnode->bp_event);
         kfree(hnode);
     }
 
@@ -779,8 +836,8 @@ void ghost_core_exit_engine(void)
     }
     spin_unlock_bh(&ledger_lock);
 
-    mempool_destroy(hwbp_tw_pool);
-    kmem_cache_destroy(hwbp_tw_cache);
+    mempool_destroy(hwbp_elastic_pool);
+    kmem_cache_destroy(hwbp_elastic_cache);
 
-    pr_info("[GhostCore V10 Engine] Resources safely drained.\n");
+    pr_info("[GhostCore V10.1 Engine] Resources safely drained.\n");
 }
