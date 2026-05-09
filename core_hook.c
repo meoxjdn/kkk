@@ -34,6 +34,7 @@
 #include <linux/string.h>
 #include <linux/completion.h>
 #include <linux/random.h>
+#include <linux/delay.h>
 #include <asm/ptrace.h>
 #include "shadow_hook.h"
 #include "dynamic_resolver.h"
