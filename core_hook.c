@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
- *       Filename:  core.c
- *    Description:  Ghost Core Engine (Deadlock Immune & Anti-Cheat Ledger)
+ *       Filename:  core_hook.c
+ *    Description:  Ghost Core Engine V10.18 (LTO Collision Safe & Deadlock Immune)
  *   Architecture:  AArch64 (ARMv8-A)
  *         Status:  Production Ready (Zero-Crash Proven Logic)
  *         Author:  顶尖逆向架构师
@@ -16,7 +16,6 @@
 #include <linux/sched/signal.h>
 #include <linux/pid.h>
 #include <linux/mutex.h>
-#include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/kprobes.h>
 #include <linux/anon_inodes.h>
@@ -66,16 +65,8 @@ struct wuwa_hbp_req {
 };
 #pragma pack(pop)
 
-struct core_cmd_packet {
-    uint32_t cmd_id;
-    uint64_t payload_ptr;
-};
-
-#define CMD_HBP_INSTALL 0x5A5A1001
-#define CMD_HBP_CLEANUP 0x5A5A1002
-
 /* ==========================================================
- * 动态函数指针与 Kprobe 符号偷渡解析器
+ * 动态函数指针与 Kprobe 符号偷渡解析器 (突破 GKI 封锁)
  * ========================================================== */
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void (*unreg_fn_t)(struct perf_event *);
@@ -290,6 +281,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     
     return 0;
 }
+EXPORT_SYMBOL(wuwa_install_perf_hbp);
 
 void wuwa_cleanup_perf_hbp(void) {
     int i;
@@ -303,6 +295,7 @@ void wuwa_cleanup_perf_hbp(void) {
     g_bp_count = 0;
     mutex_unlock(&g_bp_mutex);
 }
+EXPORT_SYMBOL(wuwa_cleanup_perf_hbp);
 
 /* ==========================================================
  * 反作弊防御矩阵：Ptrace 楚门的世界与 Perf 幻象
@@ -384,48 +377,9 @@ static int handler_pre_perf_event_open(struct kprobe *p, struct pt_regs *regs) {
 }
 
 /* ==========================================================
- * VFS 通信网关 (集成于单体文件中)
+ * 潜行引擎初始化与销毁 (由 main.c 调用)
  * ========================================================== */
-static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
-    struct core_cmd_packet pkt;
-    struct wuwa_hbp_req req;
-    int ret;
-    
-    if (count != sizeof(pkt)) return -EINVAL;
-    if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
-    
-    if (pkt.cmd_id == CMD_HBP_INSTALL) {
-        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) {
-            return -EFAULT;
-        }
-        ret = wuwa_install_perf_hbp(&req);
-        if (ret < 0) return ret;
-    } 
-    else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
-        wuwa_cleanup_perf_hbp();
-    }
-    
-    return count;
-}
-
-static const struct file_operations core_fops = {
-    .owner = THIS_MODULE,
-    .write = core_write,
-};
-
-static struct miscdevice core_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "logd_service",
-    .fops  = &core_fops,
-};
-
-/* ==========================================================
- * 模块初始化与注销
- * ========================================================== */
-static int __init wuwa_hbp_init_module(void) {
-    int ret;
-    
-    /* 挂载隐身衣 Kprobe */
+int ghost_core_init_engine(void) {
     kp_ptrace.symbol_name = "__arm64_sys_ptrace"; 
     kp_ptrace.pre_handler = handler_pre_ptrace;
     register_kprobe(&kp_ptrace);
@@ -434,22 +388,12 @@ static int __init wuwa_hbp_init_module(void) {
     kp_perf_event_open.pre_handler = handler_pre_perf_event_open;
     register_kprobe(&kp_perf_event_open);
 
-    ret = misc_register(&core_misc);
-    
-    pr_info("[WuWa Core V10.18] Deadlock Immune & Stealth Edition Online.\n");
-    return ret;
+    return 0;
 }
+EXPORT_SYMBOL(ghost_core_init_engine);
 
-static void __exit wuwa_hbp_cleanup_module(void) {
+void ghost_core_exit_engine(void) {
     if (kp_ptrace.addr) unregister_kprobe(&kp_ptrace);
     if (kp_perf_event_open.addr) unregister_kprobe(&kp_perf_event_open);
-    
-    wuwa_cleanup_perf_hbp();
-    misc_deregister(&core_misc);
-    
-    pr_info("[WuWa Core V10.18] Traces erased cleanly.\n");
 }
-
-module_init(wuwa_hbp_init_module);
-module_exit(wuwa_hbp_cleanup_module);
-MODULE_LICENSE("GPL");
+EXPORT_SYMBOL(ghost_core_exit_engine);
