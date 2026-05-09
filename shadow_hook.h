@@ -26,6 +26,12 @@ struct get_pid_req {
     pid_t pid;              /* 内核解析后填充的 PID */
 };
 
+/* 硬件断点生命周期控制请求 */
+struct hwbp_req {
+    pid_t tgid;
+    unsigned long target_addr;
+};
+
 /* Ring 0 内核级基址获取请求 */
 struct module_base_req {
     pid_t pid;
