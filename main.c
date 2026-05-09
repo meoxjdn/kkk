@@ -16,7 +16,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
 MODULE_DESCRIPTION("Ghost Core Stealth Gateway");
 
-/* VFS 通信网关，接收用户态传递的物理地址配置 */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
     struct wuwa_hbp_req req;
@@ -53,21 +52,20 @@ static struct miscdevice core_misc = {
 static int __init wuwa_hbp_init_module(void) {
     int ret;
 
-    /* 1. 先点火底层隐身探针与解析引擎 */
     ret = ghost_core_init_engine();
     if (ret < 0) {
-        pr_err("[WuWa Gateway] Core engine failed to ignite.\n");
+        pr_err("[WuWa Gateway] Core engine failed to ignite. Err: %d\n", ret);
         return ret;
     }
 
-    /* 2. 再注册虚拟字符设备对外暴露通信点 */
     ret = misc_register(&core_misc);
     if (ret < 0) {
         ghost_core_exit_engine();
+        pr_err("[WuWa Gateway] Failed to register misc device.\n");
         return ret;
     }
 
-    pr_info("[WuWa Gateway] VFS Gateway Online.\n");
+    pr_info("[WuWa Gateway] Stealth VFS Gateway Online.\n");
     return 0;
 }
 
@@ -77,6 +75,5 @@ static void __exit wuwa_hbp_cleanup_module(void) {
     pr_info("[WuWa Gateway] Traces erased cleanly.\n");
 }
 
-/* 整个工程唯一的 ELF 入口与出口 */
 module_init(wuwa_hbp_init_module);
 module_exit(wuwa_hbp_cleanup_module);
