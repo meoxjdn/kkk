@@ -6,45 +6,28 @@
 
 #define GHOST_MAGIC 'G'
 
-#define IOCTL_CMD_ALLOC_GHOST   _IOWR(GHOST_MAGIC, 1, struct ghost_alloc_req)
-#define IOCTL_CMD_SET_UXN_TRAP  _IOW(GHOST_MAGIC, 2, struct uxn_trap_req)
-#define IOCTL_CMD_SET_HWBP      _IOW(GHOST_MAGIC, 3, struct hwbp_req)
-#define IOCTL_CMD_DISABLE_HWBP  _IOW(GHOST_MAGIC, 4, struct hwbp_req)
-#define IOCTL_CMD_ENABLE_HWBP   _IOW(GHOST_MAGIC, 5, struct hwbp_req)
-#define IOCTL_CMD_HIDE_VMA      _IOW(GHOST_MAGIC, 6, struct hide_vma_req)
+/* 废弃原有的零碎 IOCTL，升级为高阶合成指令 */
+#define IOCTL_CMD_GET_BASE           _IOWR(GHOST_MAGIC, 7, struct module_base_req)
+#define IOCTL_CMD_DEPLOY_SHADOW_PATCH _IOW(GHOST_MAGIC, 8, struct shadow_patch_req)
 
-struct ghost_alloc_req {
-    pid_t pid;                  /* 新增：目标进程PID，用于寄生注入 */
-    unsigned long target_va;    
-    unsigned long size;         
-    void __user *bytecode;      
-};
-
-struct uxn_trap_req {
+/* 获取模块基址请求 */
+struct module_base_req {
     pid_t pid;
-    unsigned long orig_page_va; 
-    unsigned long recomp_va;    
-    u32 offset_map[1024];       
+    char mod_name[64];      /* 目标库名，如 libil2cpp.so */
+    uint64_t base_addr;     /* 内核返回的基址 */
 };
 
-struct hwbp_req {
-    pid_t tgid;
-    unsigned long target_addr;
-};
-
-struct hide_vma_req {
-    pid_t tgid;
-    unsigned long start_va;
-    unsigned long end_va;
+/* 原子化影子页部署请求 */
+struct shadow_patch_req {
+    pid_t pid;
+    uint64_t target_addr;   /* 目标函数的绝对物理地址 */
+    uint32_t patch_data[16];/* 汇编载荷 (最大支持 16 条指令) */
+    size_t patch_words;     /* 载荷指令数 */
 };
 
 extern int ghost_core_init_engine(void);
 extern void ghost_core_exit_engine(void);
-
-extern long handle_alloc_ghost(struct ghost_alloc_req *req);
-extern long handle_set_uxn_trap(struct uxn_trap_req *req);
-extern long handle_set_hwbp(struct hwbp_req *req);
-extern long handle_hwbp_gate(struct hwbp_req *req, bool enable);
-extern long handle_hide_vma(struct hide_vma_req *req);
+extern long handle_get_module_base(struct module_base_req *req);
+extern long handle_deploy_shadow_patch(struct shadow_patch_req *req);
 
 #endif /* _SHADOW_HOOK_H */
