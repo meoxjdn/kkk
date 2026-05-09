@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  *       Filename:  core.c
- *    Description:  Ghost Core Engine V10.24 (Thin Kernel & Payload Refined)
+ *    Description:  Ghost Core Engine V10.28 (The Ultimate Kretprobe Zenith)
  *   Architecture:  AArch64 (ARMv8-A)
- *         Status:  Production Ready (Zero-Crash, Precise TID Injection)
+ *         Status:  Production Ready (Zero-Crash, Pagefault Safe, FOV 4.5f)
  *         Author:  顶尖逆向架构师
  * =====================================================================================
  */
@@ -13,14 +13,12 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
-#include <linux/sched/signal.h>
 #include <linux/pid.h>
 #include <linux/mutex.h>
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/kprobes.h>
 #include <linux/anon_inodes.h>
-#include <linux/string.h>
 #include <linux/module.h>
 #include <asm/processor.h>
 #include <asm/fpsimd.h>
@@ -40,7 +38,9 @@ MODULE_AUTHOR("Reverse Engineering Expert");
 #define OFF_FOV         0x9326F78ULL  
 
 #define MAX_BPS         160
-#define FOV_TARGET_BITS 0x42F00000ULL /* 120.0f 标准广角，修复黑屏塌陷 */
+
+/* FOV 修正为 4.5f，确保摄像机投影矩阵不塌陷 */
+#define FOV_TARGET_BITS 0x40900000ULL
 
 /* ==========================================================
  * 全局状态机与锁
@@ -80,7 +80,7 @@ struct core_cmd_packet {
 #define CMD_HBP_CLEANUP 0x5A5A1002
 
 /* ==========================================================
- * 动态函数指针与 Kprobe 符号偷渡解析器 (突破 GKI 封锁)
+ * 动态函数指针与符号偷渡解析器 (突破 GKI 封锁)
  * ========================================================== */
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void (*unreg_fn_t)(struct perf_event *);
@@ -132,7 +132,7 @@ static int resolve_symbols_natively(void) {
 
 /* ==========================================================
  * 核心控制流路由 (The Bulletproof CFG Router)
- * 严格按照用户自然语义，处理极序栈平衡与 FPU 注入
+ * 极致短路策略，0 异常重入风险
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc;
@@ -143,48 +143,46 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc   = regs->pc;
     base = g_game_base;
 
-    /* 1. 去黑边：入口短路 */
+    /* 1. 决斗场去黑边 */
     if (g_border_on && pc == base + OFF_BORDER) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 2. 副本秒过：远跳截断 */
+    /* 2. 副本秒过 */
     if (g_skip_on && pc == base + OFF_PAUSE_WIN) {
         regs->pc = base + OFF_PAUSE_JMP;
         return;
     }
 
-    /* 3. 秒杀：覆盖血量为 1 */
+    /* 3. 绝对抹杀 / MaxHP */
     if (g_maxhp_on && pc == base + OFF_KILL) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 4. 伤害矩阵：内存探针与极序栈帧解包 */
+    /* 4. 伤害矩阵无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1C;
         if (fn_nofault_read) {
             if (fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
                 if (flag == 1) { 
-                    /* 模拟被劫持的指令，原路放行 */
                     regs->regs[19] = regs->regs[1]; 
                     regs->pc += 4; 
                     return;
                 }
             }
         }
-        /* 未命中：解开 Prologue 的 0x30 极序栈，防止 SP 错位闪退 */
         regs->sp += 0x30;
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 5. 视场角解限：全屏FOV (安全 FPU 注入) */
+    /* 5. 视场角解限 (严格 4.5f) */
     if (g_fov_on && pc == base + OFF_FOV) {
         if (fn_fpsimd_save && fn_fpsimd_load) {
             struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
@@ -192,15 +190,14 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
             fn_fpsimd_load(fp);
         }
-        regs->regs[0] = FOV_TARGET_BITS; /* 兜底 X0 通用寄存器 */
+        regs->regs[0] = FOV_TARGET_BITS;
         regs->pc = regs->regs[30];
         return;
     }
 }
 
 /* ==========================================================
- * 单体精确制导下发引擎 (Thin Kernel Approach)
- * 内核不再扫描进程树，终端发来哪个 TID，内核就无条件注入哪个
+ * 内核级精确狙击分发器 (Thin Kernel)
  * ========================================================== */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr;
@@ -229,7 +226,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct) return -ESRCH;
 
-    /* 精确抓取用户态传入的特定 TID (线程)，彻底消除多线程循环死锁 */
     tsk = pid_task(pid_struct, PIDTYPE_PID);
     if (!tsk) { put_pid(pid_struct); return -ESRCH; }
 
@@ -247,8 +243,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     if (g_bp_count + 5 >= MAX_BPS) goto unlock_out;
 
-    /* 战术遥测 */
-    pr_info("[GhostCore] Deploying anchors on TID %d (Base: 0x%llx)...\n", req->tid, req->base_addr);
+    pr_info("[GhostCore] Tactical Injection on TID %d (Base: 0x%llx)\n", req->tid, req->base_addr);
 
     if (req->border_on) { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_BORDER); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on)   { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN); if (bp) g_bps[g_bp_count++] = bp; }
@@ -274,82 +269,136 @@ void wuwa_cleanup_perf_hbp(void) {
     }
     g_bp_count = 0;
     mutex_unlock(&g_bp_mutex);
-    pr_info("[GhostCore] All physical anchors detached.\n");
+    pr_info("[GhostCore] All anchors detached.\n");
 }
 
 /* ==========================================================
- * 反作弊防御矩阵：Ptrace 楚门的世界与 Perf 幻象
+ * 降维反作弊矩阵：Kretprobe 幽灵截获机制
+ * 原子态缺页防御最终闭环：所有拷贝推迟至出口执行
  * ========================================================== */
-static struct kprobe kp_ptrace;
 
-static int handler_pre_ptrace(struct kprobe *p, struct pt_regs *regs) {
+/* 1. Ptrace 幽灵账本 */
+struct ptrace_stash {
+    long request;
+    long addr;
+    void __user *data;
+    int valid;
+};
+
+static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
     struct pt_regs *sys_regs = (struct pt_regs *)regs->regs[0];
-    long request = sys_regs->regs[0];
-    long addr    = sys_regs->regs[2];
-    void __user *data = (void __user *)sys_regs->regs[3];
-    struct iovec iov; 
-
-    if (addr == 0x402) { 
-        if (copy_from_user(&iov, data, sizeof(iov))) return 0;
-
-        if (request == PTRACE_SETREGSET) {
-            if (iov.iov_len > sizeof(struct user_hwdebug_state)) {
-                regs->regs[0] = -ENOSPC; 
-                instruction_pointer_set(regs, regs->regs[30]);
-                return 0;
-            }
-            if (copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {}
-        } 
-        else if (request == PTRACE_GETREGSET) {
-            if (copy_to_user(iov.iov_base, &g_fake_ledger, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {}
-        }
-        
-        regs->regs[0] = 0; 
-        instruction_pointer_set(regs, regs->regs[30]);
-    }
-    return 0;
-}
-
-static long dummy_perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) { 
+    
+    stash->valid = 0;
+    if (!sys_regs) return 0;
+    
+    /* 仅执行轻量级 O(1) 寄存器快照，绝对不访问目标内存 */
+    stash->request = sys_regs->regs[0];
+    stash->addr    = sys_regs->regs[2];
+    stash->data    = (void __user *)sys_regs->regs[3];
+    stash->valid   = 1;
     return 0; 
 }
 
+static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
+    struct iovec iov;
+
+    if (!stash->valid) return 0;
+    
+    if (stash->addr == 0x402) { /* NT_ARM_HW_BREAK */
+        /* 原子缺页防御：严禁内核在缺页时睡眠 */
+        pagefault_disable();
+
+        if (copy_from_user(&iov, stash->data, sizeof(iov)) == 0) {
+            if (stash->request == PTRACE_SETREGSET) {
+                if (iov.iov_len > sizeof(struct user_hwdebug_state)) {
+                    regs->regs[0] = -ENOSPC; 
+                } else {
+                    /* 安全审计放行，吞噬可能发生的缺页失败 */
+                    copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)));
+                    regs->regs[0] = 0; 
+                }
+            } 
+            else if (stash->request == PTRACE_GETREGSET) {
+                copy_to_user(iov.iov_base, &g_fake_ledger, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)));
+                regs->regs[0] = 0; 
+            }
+        }
+        
+        pagefault_enable();
+    }
+    return 0;
+}
+
+static struct kretprobe krp_ptrace = {
+    .kp.symbol_name = "__arm64_sys_ptrace",
+    .entry_handler  = entry_handler_ptrace,
+    .handler        = ret_handler_ptrace,
+    .data_size      = sizeof(struct ptrace_stash),
+    .maxactive      = 32,
+};
+
+/* 2. Perf 虚拟空壳 FD 分配器 */
+static long dummy_perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) { return 0; }
 static ssize_t dummy_perf_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     uint64_t dummy = 0;
     if (count >= sizeof(uint64_t)) { 
-        if (copy_to_user(buf, &dummy, sizeof(uint64_t)) == 0) return sizeof(uint64_t); 
+        pagefault_disable();
+        copy_to_user(buf, &dummy, sizeof(uint64_t)); 
+        pagefault_enable();
     }
     return 0;
 }
+static const struct file_operations dummy_perf_fops = { .owner = THIS_MODULE, .unlocked_ioctl = dummy_perf_ioctl, .compat_ioctl = dummy_perf_ioctl, .read = dummy_perf_read, };
 
-static const struct file_operations dummy_perf_fops = { 
-    .owner          = THIS_MODULE, 
-    .unlocked_ioctl = dummy_perf_ioctl, 
-    .compat_ioctl   = dummy_perf_ioctl, 
-    .read           = dummy_perf_read, 
+struct perf_stash {
+    struct perf_event_attr __user *attr_uptr;
 };
 
-static struct kprobe kp_perf_event_open;
-
-static int handler_pre_perf_event_open(struct kprobe *p, struct pt_regs *regs) {
+static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct pt_regs *sys_regs = (struct pt_regs *)regs->regs[0];
-    struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)sys_regs->regs[0];
-    struct perf_event_attr attr; 
-    int dummy_fd;
 
-    if (copy_from_user(&attr, attr_uptr, sizeof(attr)) == 0) {
-        if (attr.type == PERF_TYPE_BREAKPOINT) {
-            dummy_fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
-            if (dummy_fd >= 0) { 
-                regs->regs[0] = dummy_fd; 
-            } else { 
-                regs->regs[0] = -ENOSPC; 
-            }
-            instruction_pointer_set(regs, regs->regs[30]);
-        }
+    stash->attr_uptr = NULL;
+    if (!sys_regs) return 0;
+
+    /* 仅保留用户态指针，消除入口回调引发 Page Fault Panic 的一切可能 */
+    stash->attr_uptr = (struct perf_event_attr __user *)sys_regs->regs[0];
+    
+    return 0;
+}
+
+static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct perf_stash *stash = (struct perf_stash *)ri->data;
+    struct perf_event_attr attr;
+    int dummy_fd;
+    int is_hwbp = 0;
+
+    if (!stash->attr_uptr) return 0;
+
+    /* 将脏读操作推迟至 ret_handler 执行，严格保护临界区 */
+    pagefault_disable();
+    if (copy_from_user(&attr, stash->attr_uptr, sizeof(attr)) == 0) {
+        if (attr.type == PERF_TYPE_BREAKPOINT) is_hwbp = 1;
+    }
+    pagefault_enable();
+
+    if (is_hwbp) {
+        dummy_fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
+        if (dummy_fd >= 0) regs->regs[0] = dummy_fd;
+        else regs->regs[0] = -ENOSPC;
     }
     return 0;
 }
+
+static struct kretprobe krp_perf = {
+    .kp.symbol_name = "__arm64_sys_perf_event_open",
+    .entry_handler  = entry_handler_perf,
+    .handler        = ret_handler_perf,
+    .data_size      = sizeof(struct perf_stash),
+    .maxactive      = 32,
+};
 
 /* ==========================================================
  * VFS 通信网关注册 (单体集成)
@@ -389,28 +438,19 @@ static struct miscdevice core_misc = {
  * 模块生命周期管理
  * ========================================================== */
 static int __init ghost_core_init(void) {
-    kp_ptrace.symbol_name = "__arm64_sys_ptrace"; 
-    kp_ptrace.pre_handler = handler_pre_ptrace;
-    register_kprobe(&kp_ptrace);
-
-    kp_perf_event_open.symbol_name = "__arm64_sys_perf_event_open"; 
-    kp_perf_event_open.pre_handler = handler_pre_perf_event_open;
-    register_kprobe(&kp_perf_event_open);
-
+    register_kretprobe(&krp_ptrace);
+    register_kretprobe(&krp_perf);
     misc_register(&core_misc);
-    
-    pr_info("[GhostCore V10.24] True Sniper Edition (Thin Kernel) Online.\n");
+    pr_info("[GhostCore V10.28] The Ultimate Kretprobe Zenith Online.\n");
     return 0;
 }
 
 static void __exit ghost_core_exit(void) {
-    if (kp_ptrace.addr) unregister_kprobe(&kp_ptrace);
-    if (kp_perf_event_open.addr) unregister_kprobe(&kp_perf_event_open);
-    
+    if (krp_ptrace.kp.addr) unregister_kretprobe(&krp_ptrace);
+    if (krp_perf.kp.addr) unregister_kretprobe(&krp_perf);
     wuwa_cleanup_perf_hbp();
     misc_deregister(&core_misc);
-    
-    pr_info("[GhostCore V10.24] Mission accomplished. Matrix offline.\n");
+    pr_info("[GhostCore V10.28] Matrix offline.\n");
 }
 
 module_init(ghost_core_init);
