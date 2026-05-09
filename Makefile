@@ -2,7 +2,7 @@
 # Ghost Core V10.21 Build System (Monolithic)
 #
 
-MODULE_NAME := android15-6.6-release
+MODULE_NAME := android-wuwa
 
 obj-m := $(MODULE_NAME).o
 $(MODULE_NAME)-objs := core.o
