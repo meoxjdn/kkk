@@ -1,3 +1,7 @@
+#
+# Ghost Core V10.5 Build System
+#
+
 MODULE_NAME := android-wuwa
 
 obj-m := $(MODULE_NAME).o
