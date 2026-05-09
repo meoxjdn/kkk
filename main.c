@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  main.c
- *    Description:  Ghost Core V10.11 Gateway Manager (HWBP & Dummy FD Orchestrator)
+ *    Description:  Ghost Core V10.11 Gateway Manager
  * =====================================================================================
  */
 #include <linux/module.h>
@@ -16,48 +16,34 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
 MODULE_DESCRIPTION("Ghost Core V10.11 Gateway");
 
-/* 
- * 核心路由矩阵：负责用户态至内核态的边界防御与控制流中转
- */
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     switch (cmd) {
-        
-        /* 索敌探测阶段 */
         case IOCTL_CMD_GET_PID: {
             struct get_pid_req pid_req;
-            if (copy_from_user(&pid_req, (void __user *)arg, sizeof(pid_req))) {
-                return -EFAULT;
-            }
+            if (copy_from_user(&pid_req, (void __user *)arg, sizeof(pid_req))) return -EFAULT;
             long ret = handle_get_pid(&pid_req);
-            if (ret == 0) {
-                if (copy_to_user((void __user *)arg, &pid_req, sizeof(pid_req))) {
-                    return -EFAULT;
-                }
-            }
+            if (ret == 0 && copy_to_user((void __user *)arg, &pid_req, sizeof(pid_req))) return -EFAULT;
             return ret;
         }
 
-        /* 内存拓扑解析阶段 */
         case IOCTL_CMD_GET_BASE: {
             struct module_base_req base_req;
-            if (copy_from_user(&base_req, (void __user *)arg, sizeof(base_req))) {
-                return -EFAULT;
-            }
+            if (copy_from_user(&base_req, (void __user *)arg, sizeof(base_req))) return -EFAULT;
             if (handle_get_module_base(&base_req) == 0) {
-                if (copy_to_user((void __user *)arg, &base_req, sizeof(base_req))) {
-                    return -EFAULT;
-                }
+                if (copy_to_user((void __user *)arg, &base_req, sizeof(base_req))) return -EFAULT;
                 return 0;
             }
             return -ESRCH;
         }
 
-        /* V10.11 HWBP 状态机与安全屋控制阶段 */
         case IOCTL_SET_HWBP:
         case IOCTL_PAUSE_HWBP:
         case IOCTL_RESUME_HWBP: {
-            /* 将控制权平滑移交给 core_hook.c 的核心状态机枢纽 */
+            /* 
+             * 核心路由下沉：所有涉及 HWBP 的指令连同结构体指针
+             * 一并转交 core_hook.c 进行拆包和处理。
+             */
             return handle_hwbp_ioctl(cmd, arg);
         }
 
