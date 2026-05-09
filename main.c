@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  main.c
- *    Description:  Ghost Core V10.11 Gateway Manager
+ *    Description:  Ghost Core Gateway (VFS Device Orchestrator)
  * =====================================================================================
  */
 #include <linux/module.h>
@@ -14,87 +14,69 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
-MODULE_DESCRIPTION("Ghost Core V10.11 Gateway");
+MODULE_DESCRIPTION("Ghost Core Stealth Gateway");
 
-static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-    switch (cmd) {
-        case IOCTL_CMD_GET_PID: {
-            struct get_pid_req pid_req;
-            if (copy_from_user(&pid_req, (void __user *)arg, sizeof(pid_req))) return -EFAULT;
-            long ret = handle_get_pid(&pid_req);
-            if (ret == 0 && copy_to_user((void __user *)arg, &pid_req, sizeof(pid_req))) return -EFAULT;
-            return ret;
-        }
-
-        case IOCTL_CMD_GET_BASE: {
-            struct module_base_req base_req;
-            if (copy_from_user(&base_req, (void __user *)arg, sizeof(base_req))) return -EFAULT;
-            if (handle_get_module_base(&base_req) == 0) {
-                if (copy_to_user((void __user *)arg, &base_req, sizeof(base_req))) return -EFAULT;
-                return 0;
-            }
-            return -ESRCH;
-        }
-
-        case IOCTL_SET_HWBP:
-        case IOCTL_PAUSE_HWBP:
-        case IOCTL_RESUME_HWBP: {
-            /* 
-             * 核心路由下沉：所有涉及 HWBP 的指令连同结构体指针
-             * 一并转交 core_hook.c 进行拆包和处理。
-             */
-            return handle_hwbp_ioctl(cmd, arg);
-        }
-
-        default:
-            pr_warn("[Ghost Gateway] Unknown IOCTL vector intercepted: 0x%x\n", cmd);
-            return -ENOTTY;
-    }
-}
-
-static const struct file_operations wuwa_fops = {
-    .owner          = THIS_MODULE,
-    .unlocked_ioctl = wuwa_ioctl,
-#ifdef CONFIG_COMPAT
-    .compat_ioctl   = wuwa_ioctl,
-#endif
-};
-
-static struct miscdevice wuwa_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "wuwa_core",
-    .fops  = &wuwa_fops,
-};
-
-static int __init wuwa_driver_init(void)
-{
+/* VFS 通信网关，接收用户态传递的物理地址配置 */
+static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
+    struct core_cmd_packet pkt;
+    struct wuwa_hbp_req req;
     int ret;
-    pr_info("[Ghost Gateway] Booting V10.11 State-Machine Orchestrator...\n");
-
-    ret = ghost_core_init_engine();
-    if (ret < 0) {
-        pr_err("[Ghost Gateway] Failed to ignite Core Engine. Aborting sequence.\n");
-        return ret;
+    
+    if (count != sizeof(pkt)) return -EINVAL;
+    if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
+    
+    if (pkt.cmd_id == CMD_HBP_INSTALL) {
+        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) {
+            return -EFAULT;
+        }
+        ret = wuwa_install_perf_hbp(&req);
+        if (ret < 0) return ret;
+    } 
+    else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
+        wuwa_cleanup_perf_hbp();
     }
     
-    ret = misc_register(&wuwa_misc);
+    return count;
+}
+
+static const struct file_operations core_fops = {
+    .owner = THIS_MODULE,
+    .write = core_write,
+};
+
+static struct miscdevice core_misc = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "logd_service",
+    .fops  = &core_fops,
+};
+
+static int __init wuwa_hbp_init_module(void) {
+    int ret;
+
+    /* 1. 先点火底层隐身探针与解析引擎 */
+    ret = ghost_core_init_engine();
     if (ret < 0) {
-        ghost_core_exit_engine();
-        pr_err("[Ghost Gateway] VFS device registration failed. Kernel locked.\n");
+        pr_err("[WuWa Gateway] Core engine failed to ignite.\n");
         return ret;
     }
 
-    pr_info("[Ghost Gateway] Engine Online. IOCTL Router active on /dev/wuwa_core.\n");
+    /* 2. 再注册虚拟字符设备对外暴露通信点 */
+    ret = misc_register(&core_misc);
+    if (ret < 0) {
+        ghost_core_exit_engine();
+        return ret;
+    }
+
+    pr_info("[WuWa Gateway] VFS Gateway Online.\n");
     return 0;
 }
 
-static void __exit wuwa_driver_exit(void)
-{
-    misc_deregister(&wuwa_misc);
+static void __exit wuwa_hbp_cleanup_module(void) {
+    misc_deregister(&core_misc);
     ghost_core_exit_engine();
-    pr_info("[Ghost Gateway] Gateway Offline. HWBP resources wiped. Trace erased.\n");
+    pr_info("[WuWa Gateway] Traces erased cleanly.\n");
 }
 
-module_init(wuwa_driver_init);
-module_exit(wuwa_driver_exit);
+/* 整个工程唯一的 ELF 入口与出口 */
+module_init(wuwa_hbp_init_module);
+module_exit(wuwa_hbp_cleanup_module);
