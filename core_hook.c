@@ -15,6 +15,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
+#include <linux/sched/signal.h> /* 修复：引入 for_each_process 宏 */
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/slab.h>
@@ -129,6 +130,12 @@ struct hwbp_elastic_node {
     unsigned long target_addr;
 };
 
+/* 适配网关层的结构体前置声明，防止编译器警告 */
+struct get_pid_req {
+    char process_name[64];
+    pid_t pid;
+};
+
 static LIST_HEAD(hidden_vma_list);
 static DEFINE_SPINLOCK(hidden_vma_lock);
 
@@ -171,6 +178,34 @@ asm(
 );
 
 /* ==========================================================
+ * 模块零：Ring 0 进程索敌引擎 (Process Targeting)
+ * ========================================================== */
+long handle_get_pid(struct get_pid_req *req)
+{
+    struct task_struct *task;
+    long ret = -ESRCH;
+
+    if (!req || !req->process_name[0]) return -EINVAL;
+
+    rcu_read_lock();
+    for_each_process(task) {
+        /*
+         * task->comm 的长度受限于 TASK_COMM_LEN (默认为 16)。
+         * 对于 "com.tencent.KiHan"，实际可能截断为 "com.tencent.KiH"。
+         * 这里使用 strstr 进行子串匹配，完美适配长包名的截断问题。
+         */
+        if (strstr(task->comm, req->process_name)) {
+            req->pid = task->tgid;
+            ret = 0;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    return ret;
+}
+
+/* ==========================================================
  * 模块一：Ring 0 VMA 解析引擎 (修复 1：时间切片与锁降级)
  * ========================================================== */
 long handle_get_module_base(struct module_base_req *req)
@@ -202,7 +237,7 @@ long handle_get_module_base(struct module_base_req *req)
             break;
         }
         
-        /* 提前提取所需属性，尽早释放锁，规避卡顿 */
+        /* 提前提取所需属性，尽早释放锁，规避目标进程卡顿 */
         search_addr = vma->vm_end;
         if (vma->vm_file && vma->vm_file->f_path.dentry && (vma->vm_flags & VM_EXEC)) {
             strncpy(name_buf, vma->vm_file->f_path.dentry->d_name.name, 255);
@@ -314,7 +349,7 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
     int i;
     bool vma_allocated = false;
 
-    if (req->patch_words > 4 || req->payload_words > 30) return -EINVAL; /* 留出跳板空间 */
+    if (req->patch_words > 4 || req->payload_words > 30) return -EINVAL;
 
     page_buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
     if (!page_buf) return -ENOMEM;
@@ -340,10 +375,8 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
 
     /* 自动跳板缝合 (Auto-Trampoline Stitching) */
     if (req->payload_words > 0 && req->payload_offset > 0 && req->payload_offset < PAGE_SIZE - 64) {
-        /* 写入用户态提供的逻辑块 */
         memcpy(page_buf + req->payload_offset, req->payload_data, req->payload_words * 4);
         
-        /* 尾部自动缝合原指令与跳回指令 */
         uint32_t *stitch_ptr = (uint32_t *)(page_buf + req->payload_offset + req->payload_words * 4);
         *stitch_ptr = orig_insn;
         
@@ -387,11 +420,9 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
     goto cleanup;
 
 err_rollback:
-    /* 事务级回滚：清理产生的副作用 */
     if (vma_allocated) {
-        force_target_mmu_op(req->pid, 2, g_ghost_alloc_base, PAGE_SIZE); /* 尝试 munmap */
+        force_target_mmu_op(req->pid, 2, g_ghost_alloc_base, PAGE_SIZE); 
     }
-    /* 注：hide_vma_list 若已注册，会在下次 show_map 时安全失效，无需强行逆向摘除链表 */
 
 cleanup:
     mutex_unlock(&ghost_alloc_mutex);
@@ -797,7 +828,6 @@ int ghost_core_init_engine(void)
         return -ENOMEM;
     }
 
-    /* 修复 3：为幽灵内存基址注入 ASLR 熵值，彻底阻断地址模式匹配 */
     get_random_bytes(&random_offset, sizeof(random_offset));
     g_ghost_alloc_base = 0x6000000000ULL + ((uint64_t)random_offset & 0x000FFFFF000ULL);
 
