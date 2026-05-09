@@ -1,16 +1,9 @@
-/*
- * shadow_hook.h - Protocol & Data Structures for Ghost Core Gateway
- */
 #ifndef _SHADOW_HOOK_H
 #define _SHADOW_HOOK_H
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-/* ==========================================================
- * 驱动通信协议 IOCTL 魔法字 (V10 标准)
- * 彻底废除 RAW_PATCH，全面转向物理维度控制
- * ========================================================== */
 #define GHOST_MAGIC 'G'
 
 #define IOCTL_CMD_ALLOC_GHOST   _IOWR(GHOST_MAGIC, 1, struct ghost_alloc_req)
@@ -20,41 +13,31 @@
 #define IOCTL_CMD_ENABLE_HWBP   _IOW(GHOST_MAGIC, 5, struct hwbp_req)
 #define IOCTL_CMD_HIDE_VMA      _IOW(GHOST_MAGIC, 6, struct hide_vma_req)
 
-/* ==========================================================
- * 用户态与内核态交互结构体
- * ========================================================== */
-
-/* 幽灵内存分配请求 */
 struct ghost_alloc_req {
+    pid_t pid;                  /* 新增：目标进程PID，用于寄生注入 */
     unsigned long target_va;    
     unsigned long size;         
-    void __user *bytecode;      /* DBI 重编译后的纯净机器码 */
+    void __user *bytecode;      
 };
 
-/* UXN 高压电网与缺页路由请求 */
 struct uxn_trap_req {
     pid_t pid;
     unsigned long orig_page_va; 
     unsigned long recomp_va;    
-    u32 offset_map[1024];       /* 物理指令偏移地图 */
+    u32 offset_map[1024];       
 };
 
-/* 硬件断点生命周期控制请求 */
 struct hwbp_req {
     pid_t tgid;
     unsigned long target_addr;
 };
 
-/* Maps 截断隐藏请求 (VMA 退路保护) */
 struct hide_vma_req {
     pid_t tgid;
     unsigned long start_va;
     unsigned long end_va;
 };
 
-/* ==========================================================
- * 引擎暴露给网关的内部接口 (跨文件链接)
- * ========================================================== */
 extern int ghost_core_init_engine(void);
 extern void ghost_core_exit_engine(void);
 
