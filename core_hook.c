@@ -175,29 +175,6 @@ asm(
 );
 
 /* ==========================================================
- * 模块零：Ring 0 进程索敌引擎 (Process Targeting)
- * ========================================================== */
-long handle_get_pid(struct get_pid_req *req)
-{
-    struct task_struct *task;
-    long ret = -ESRCH;
-
-    if (!req || !req->process_name[0]) return -EINVAL;
-
-    rcu_read_lock();
-    for_each_process(task) {
-        if (strncmp(task->comm, req->process_name, TASK_COMM_LEN - 1) == 0) {
-            req->pid = task->tgid;
-            ret = 0;
-            break;
-        }
-    }
-    rcu_read_unlock();
-
-    return ret;
-}
-
-/* ==========================================================
  * 模块零：Ring 0 进程索敌引擎 (通过 cmdline 精确匹配)
  * ========================================================== */
 long handle_get_pid(struct get_pid_req *req)
