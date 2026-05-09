@@ -186,12 +186,7 @@ long handle_get_pid(struct get_pid_req *req)
 
     rcu_read_lock();
     for_each_process(task) {
-        /*
-         * task->comm 的长度受限于 TASK_COMM_LEN (默认为 16)。
-         * 对于 "com.tencent.KiHan"，实际可能截断为 "com.tencent.KiH"。
-         * 这里使用 strstr 进行子串匹配，完美适配长包名的截断问题。
-         */
-        if (strstr(task->comm, req->process_name)) {
+        if (strncmp(task->comm, req->process_name, TASK_COMM_LEN - 1) == 0) {
             req->pid = task->tgid;
             ret = 0;
             break;
