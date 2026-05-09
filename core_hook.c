@@ -198,6 +198,49 @@ long handle_get_pid(struct get_pid_req *req)
 }
 
 /* ==========================================================
+ * 模块零：Ring 0 进程索敌引擎 (通过 cmdline 精确匹配)
+ * ========================================================== */
+long handle_get_pid(struct get_pid_req *req)
+{
+    struct task_struct *task;
+    struct mm_struct *mm;
+    char *cmdline_buf;
+    long ret = -ESRCH;
+
+    if (!req || !req->process_name[0])
+        return -EINVAL;
+
+    cmdline_buf = kzalloc(256, GFP_KERNEL);
+    if (!cmdline_buf)
+        return -ENOMEM;
+
+    rcu_read_lock();
+    for_each_process(task) {
+        mm = get_task_mm(task);
+        if (!mm)
+            continue;
+
+        if (mm->arg_end > mm->arg_start) {
+            int len = min_t(unsigned long, mm->arg_end - mm->arg_start, 255);
+            if (access_process_vm(task, mm->arg_start, cmdline_buf, len, 0) == len) {
+                cmdline_buf[len] = '\0';
+                if (strcmp(cmdline_buf, req->process_name) == 0) {
+                    req->pid = task->tgid;
+                    ret = 0;
+                    mmput(mm);
+                    break;
+                }
+            }
+        }
+        mmput(mm);
+    }
+    rcu_read_unlock();
+
+    kfree(cmdline_buf);
+    return ret;
+}
+
+/* ==========================================================
  * 模块一：Ring 0 VMA 解析引擎 (修复 1：时间切片与锁降级)
  * ========================================================== */
 long handle_get_module_base(struct module_base_req *req)
