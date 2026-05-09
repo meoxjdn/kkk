@@ -20,7 +20,7 @@ on:
 
 jobs:
   build-module:
-    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
+    name: Build ${{ inputs.module_name }} for ${{ inputs.kmi }}
     runs-on: ubuntu-latest
     container:
       # 拉取指定版本的 Android GKI 编译环境
@@ -38,22 +38,32 @@ jobs:
         
         mkdir -p /github/workspace/out
         
-        # 核心改写点：利用 cut 命令切割字符串，只保留内核版本号
-        # 例如从 "android16-6.12" 提取出 "6.12"
-        SHORT_KMI=$(echo "${{ inputs.kmi }}" | cut -d'-' -f2)
-        OUTPUT_NAME="${SHORT_KMI}.ko"
+        # 核心修复：使用完整的 KMI 字符串作为标识，彻底杜绝矩阵并发时的命名覆写灾难
+        FULL_KMI="${{ inputs.kmi }}"
+        DEBUG_KO="${FULL_KMI}-debug.ko"
+        RELEASE_KO="${FULL_KMI}-release.ko"
         
-        cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
+        echo "=== Preserving Debug Symbols (For IDA Pro / Crash Analysis) ==="
+        cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$DEBUG_KO"
 
-        echo "=== Stripping debug symbols to reduce size ==="
-        llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
+        echo "=== Stripping Symbols (For Stealth Deployment) ==="
+        cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$RELEASE_KO"
         
-        # 将最终文件名写入环境变量，传递给下一步
-        echo "ARTIFACT_NAME=$OUTPUT_NAME" >> $GITHUB_ENV
+        # 鲁棒性加固：优先使用内核编译环境内置的 strip 工具链，保障底层 ELF 结构 ABI 绝对一致
+        if [ -n "$STRIP" ] && command -v "$STRIP" &> /dev/null; then
+            $STRIP -d "/github/workspace/out/$RELEASE_KO"
+        elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}strip" &> /dev/null; then
+            ${CROSS_COMPILE}strip -d "/github/workspace/out/$RELEASE_KO"
+        else
+            # 降级退路
+            llvm-strip -d "/github/workspace/out/$RELEASE_KO"
+        fi
+        
+        # 将唯一的产物包名称写入环境变量
+        echo "ARTIFACT_NAME=$FULL_KMI-artifacts" >> $GITHUB_ENV
 
-    - name: Upload Build Artifacts
+    - name: Upload Dual-Track Artifacts
       uses: actions/upload-artifact@v4
       with:
-        # 上传的压缩包和内部文件都将是干净的 6.12.ko 形式
         name: ${{ env.ARTIFACT_NAME }}
-        path: /github/workspace/out/${{ env.ARTIFACT_NAME }}
+        path: /github/workspace/out/
