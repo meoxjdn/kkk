@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  shadow_hook.h
- *    Description:  Ghost Core V10.5 Protocol Definitions (Zero VFS Footprint)
+ *    Description:  Ghost Core V10.6 Protocol Definitions (Absolute Zero VFS Footprint)
  * =====================================================================================
  */
 #ifndef _SHADOW_HOOK_H
@@ -18,6 +18,13 @@
 #define IOCTL_CMD_GET_BASE            _IOWR(GHOST_MAGIC, 7, struct module_base_req)
 #define IOCTL_CMD_DEPLOY_SHADOW_PATCH _IOW(GHOST_MAGIC, 8, struct shadow_patch_req)
 #define IOCTL_CMD_HIDE_VMA            _IOW(GHOST_MAGIC, 6, struct hide_vma_req)
+#define IOCTL_CMD_GET_PID             _IOWR(GHOST_MAGIC, 9, struct get_pid_req)
+
+/* Ring 0 内核级目标进程索敌请求 */
+struct get_pid_req {
+    char process_name[64];  /* 由用户态传入的包名/进程名 (如 com.tencent.KiHan) */
+    pid_t pid;              /* 内核解析后填充的 PID */
+};
 
 /* Ring 0 内核级基址获取请求 */
 struct module_base_req {
@@ -47,6 +54,7 @@ struct hide_vma_req {
 /* 核心引擎暴漏给网关的链接符号 */
 extern int ghost_core_init_engine(void);
 extern void ghost_core_exit_engine(void);
+extern long handle_get_pid(struct get_pid_req *req);
 extern long handle_get_module_base(struct module_base_req *req);
 extern long handle_deploy_shadow_patch(struct shadow_patch_req *req);
 extern long handle_hide_vma(struct hide_vma_req *req);
