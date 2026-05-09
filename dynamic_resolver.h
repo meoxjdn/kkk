@@ -9,7 +9,7 @@
 #define _GHOST_DYNAMIC_RESOLVER_H
 
 /*
- * 初始化动态解析引擎，利用 Dummy Kprobe 萃取 kallsyms_lookup_name。
+ * 初始化动态解析引擎，萃取 kallsyms_lookup_name。
  * 返回值: 0 成功; 负数 失败
  */
 extern int ghost_resolver_init(void);
