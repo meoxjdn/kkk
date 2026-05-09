@@ -2,9 +2,9 @@
  * =====================================================================================
  * 
  *       Filename:  core_hook.c
- *    Description:  Ghost Core V10.6.1 (Zero-Footprint, ASLR, Lock-Free, Safe-Teardown)
+ *    Description:  Ghost Core V10.6 (Zero-Footprint, ASLR, Auto-Trampoline, Lock-Free)
  *   Architecture:  AArch64 (ARMv8-A)
- *         Status:  Production Ready (Unload Panic Fixed)
+ *         Status:  Production Ready (Compilation Errors Fixed, Unload Panic Fixed)
  *         Author:  顶尖逆向架构师
  * 
  * =====================================================================================
@@ -15,7 +15,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
-#include <linux/sched/signal.h>
+#include <linux/sched/signal.h> /* 修复：引入 for_each_process 宏，解决模块零索敌编译问题 */
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/slab.h>
@@ -34,10 +34,19 @@
 #include <linux/string.h>
 #include <linux/completion.h>
 #include <linux/random.h>
-#include <linux/delay.h>
 #include <asm/ptrace.h>
 #include "shadow_hook.h"
 #include "dynamic_resolver.h"
+
+/* ==========================================================
+ * 结构体防断裂声明 (防止 shadow_hook.h 未同步导致的流水线编译报错)
+ * ========================================================== */
+struct hwbp_req {
+    pid_t tgid;
+    unsigned long target_addr;
+};
+
+
 
 /* ==========================================================
  * 物理权限与微型汇编器
@@ -118,6 +127,11 @@ struct ptrace_ledger {
     struct user_hwdebug_state wp_state;
 };
 
+struct hwbp_teardown_work {
+    struct work_struct work;
+    struct hwbp_thread_node *node;
+};
+
 struct hwbp_elastic_node {
     struct callback_head t_work;
     struct work_struct w_work;
@@ -125,8 +139,6 @@ struct hwbp_elastic_node {
     pid_t tgid;
     unsigned long target_addr;
 };
-
-/* 适配索敌 */
 
 static LIST_HEAD(hidden_vma_list);
 static DEFINE_SPINLOCK(hidden_vma_lock);
@@ -170,7 +182,7 @@ asm(
 );
 
 /* ==========================================================
- * 模块零：Ring 0 进程索敌引擎
+ * 模块零：Ring 0 进程索敌引擎 (通过 cmdline 精确匹配)
  * ========================================================== */
 long handle_get_pid(struct get_pid_req *req)
 {
@@ -189,13 +201,15 @@ long handle_get_pid(struct get_pid_req *req)
     rcu_read_lock();
     for_each_process(task) {
         mm = get_task_mm(task);
-        if (!mm) continue;
+        if (!mm)
+            continue;
 
+        /* 读取进程的命令行参数以规避 comm 的 16 字节截断限制 */
         if (mm->arg_end > mm->arg_start) {
             int len = min_t(unsigned long, mm->arg_end - mm->arg_start, 255);
             if (access_process_vm(task, mm->arg_start, cmdline_buf, len, 0) == len) {
                 cmdline_buf[len] = '\0';
-                if (strcmp(cmdline_buf, req->process_name) == 0) {
+                if (strstr(cmdline_buf, req->process_name)) {
                     req->pid = task->tgid;
                     ret = 0;
                     mmput(mm);
@@ -212,7 +226,7 @@ long handle_get_pid(struct get_pid_req *req)
 }
 
 /* ==========================================================
- * 模块一：Ring 0 VMA 解析引擎
+ * 模块一：Ring 0 VMA 解析引擎 (时间切片与锁降级)
  * ========================================================== */
 long handle_get_module_base(struct module_base_req *req)
 {
@@ -243,6 +257,7 @@ long handle_get_module_base(struct module_base_req *req)
             break;
         }
         
+        /* 提前提取所需属性，尽早释放锁，规避目标进程卡顿 */
         search_addr = vma->vm_end;
         if (vma->vm_file && vma->vm_file->f_path.dentry && (vma->vm_flags & VM_EXEC)) {
             strncpy(name_buf, vma->vm_file->f_path.dentry->d_name.name, 255);
@@ -323,7 +338,7 @@ static long force_target_mmu_op(pid_t pid, int op, unsigned long addr, unsigned 
 }
 
 /* ==========================================================
- * 模块三：影子页锻造与闭环注入 
+ * 模块三：影子页锻造与闭环注入 (事务回滚与跳板缝合)
  * ========================================================== */
 long handle_hide_vma(struct hide_vma_req *req)
 {
@@ -364,15 +379,18 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
 
     mutex_lock(&ghost_alloc_mutex);
 
+    /* 提取原页与原指令 */
     if (access_process_vm(task, page_start, page_buf, PAGE_SIZE, FOLL_FORCE) != PAGE_SIZE) {
         ret = -EFAULT; goto err_rollback;
     }
     memcpy(&orig_insn, page_buf + page_offset, 4);
 
+    /* 植入用户态基础 Patch */
     if (req->patch_words > 0) {
         memcpy(page_buf + page_offset, req->patch_data, req->patch_words * 4);
     }
 
+    /* 自动跳板缝合 (Auto-Trampoline Stitching) */
     if (req->payload_words > 0 && req->payload_offset > 0 && req->payload_offset < PAGE_SIZE - 64) {
         memcpy(page_buf + req->payload_offset, req->payload_data, req->payload_words * 4);
         
@@ -383,14 +401,17 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
         *(stitch_ptr + 1) = ghost_make_b(current_ghost_pc, req->target_addr + 4);
     }
 
+    /* 申请寄生 VMA */
     ret = force_target_mmu_op(req->pid, 0, g_ghost_alloc_base, PAGE_SIZE);
     if (IS_ERR_VALUE(ret) && ret != g_ghost_alloc_base) goto err_rollback;
     vma_allocated = true;
 
+    /* 写入幽灵数据 */
     if (access_process_vm(task, g_ghost_alloc_base, page_buf, PAGE_SIZE, FOLL_WRITE | FOLL_FORCE) != PAGE_SIZE) {
         ret = -EFAULT; goto err_rollback;
     }
 
+    /* 隐身与路由构建 */
     hide_req.tgid = req->pid;
     hide_req.start_va = g_ghost_alloc_base;
     hide_req.end_va = g_ghost_alloc_base + PAGE_SIZE;
@@ -496,7 +517,7 @@ static int handler_pre_notify_segfault(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ==========================================================
- * 模块六：HWBP 弹性生命周期守护系统 (修复 UAF 卸载崩溃)
+ * 模块六：HWBP 弹性生命周期守护系统
  * ========================================================== */
 static inline unsigned long strip_pac(unsigned long addr) { 
     return addr & ~0xFF00000000000000ULL; 
@@ -620,10 +641,70 @@ static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-/*
- * 致命修复区：彻底砍掉 UAF 的罪魁祸首 teardown_hwbp_worker。
- * 内核会在线程销毁时自动回收 perf_event，强行 unregister 会导致 Double-Free!
- */
+long handle_set_hwbp(struct hwbp_req *req)
+{
+    struct task_struct *g, *t;
+    struct hwbp_target *tgt;
+    struct task_struct **tasks = NULL;
+    int count = 0, i = 0;
+
+    tgt = kzalloc(sizeof(*tgt), GFP_KERNEL);
+    if (!tgt) return -ENOMEM;
+    tgt->tgid = req->tgid;
+    tgt->orig_entry = req->target_addr;
+
+    spin_lock_bh(&hwbp_target_lock);
+    list_add_rcu(&tgt->list, &hwbp_target_list);
+    spin_unlock_bh(&hwbp_target_lock);
+
+    rcu_read_lock();
+    for_each_process_thread(g, t) {
+        if (t->tgid == req->tgid) count++;
+    }
+    rcu_read_unlock();
+
+    if (count == 0) return 0;
+
+    tasks = kmalloc_array(count, sizeof(*tasks), GFP_KERNEL);
+    if (!tasks) return -ENOMEM;
+
+    count = 0;
+    rcu_read_lock();
+    for_each_process_thread(g, t) {
+        if (t->tgid == req->tgid) {
+            get_task_struct(t); 
+            tasks[count++] = t;
+        }
+    }
+    rcu_read_unlock();
+
+    for (i = 0; i < count; i++) {
+        install_hwbp_for_thread(tasks[i], req->tgid, req->target_addr);
+        put_task_struct(tasks[i]);
+    }
+    kfree(tasks);
+    return 0;
+}
+
+long handle_hwbp_gate(struct hwbp_req *req, bool enable)
+{
+    struct hwbp_thread_node *node;
+    pid_t current_tid = current->pid;
+    pid_t current_tgid = current->tgid;
+    
+    rcu_read_lock();
+    list_for_each_entry_rcu(node, &hwbp_thread_list, list) {
+        if (node->tgid == current_tgid && node->tid == current_tid && node->orig_entry == req->target_addr) {
+            if (enable) perf_event_enable(node->bp_event);
+            else        perf_event_disable(node->bp_event);
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return 0;
+}
+
+/* 核心修复：砍掉导致 Double-Free 的工作队列，交还回收权给内核 */
 static struct kprobe kp_do_exit;
 static int handler_pre_do_exit(struct kprobe *p, struct pt_regs *regs)
 {
@@ -637,7 +718,6 @@ static int handler_pre_do_exit(struct kprobe *p, struct pt_regs *regs)
     list_for_each_entry_safe(node, ntmp, &hwbp_thread_list, list) {
         if (node->tid == current_tid) {
             list_del_rcu(&node->list);
-            /* 将节点直接释放，把 bp_event 留给内核的 perf_event_exit_task 回收 */
             kfree_rcu(node, rcu); 
         }
     }
@@ -648,6 +728,7 @@ static int handler_pre_do_exit(struct kprobe *p, struct pt_regs *regs)
 /* ==========================================================
  * 模块七：统一资源账本与防护
  * ========================================================== */
+
 static struct kprobe kp_ptrace;
 static struct kprobe kp_perf_event_open;
 static struct kprobe kp_sys_ioctl;
@@ -784,7 +865,7 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ==========================================================
- * 生命引擎：装载与绝对安全的释放隔离
+ * 生命引擎：装载与析构
  * ========================================================== */
 
 int ghost_core_init_engine(void)
@@ -867,14 +948,12 @@ void ghost_core_exit_engine(void)
     struct ptrace_ledger *lnode, *ltmp;
     struct hwbp_thread_node *hnode, *htmp;
     
-    /* 本地隔离链表，用于安全析构 */
     LIST_HEAD(local_hwbp);
     LIST_HEAD(local_vma);
     LIST_HEAD(local_uxn);
     LIST_HEAD(local_target);
     LIST_HEAD(local_ledger);
 
-    /* 致命修复 1：仅注销注册成功的探针，防 Hash 崩溃 */
     if (krp_show_map.kp.addr) unregister_kretprobe(&krp_show_map);
     if (kp_notify_segfault.addr) unregister_kprobe(&kp_notify_segfault);
     if (kp_wake_up_new_task.addr) unregister_kprobe(&kp_wake_up_new_task);
@@ -883,21 +962,17 @@ void ghost_core_exit_engine(void)
     if (kp_perf_event_open.addr) unregister_kprobe(&kp_perf_event_open);
     if (kp_sys_ioctl.addr) unregister_kprobe(&kp_sys_ioctl);
 
-    /* 致命修复 2：排干残留工作队列与 Task_Work，防止幽灵执行 */
     flush_scheduled_work();
     msleep(200); 
 
-    /* 致命修复 3：原子化链表切割 */
     spin_lock_bh(&hwbp_thread_lock); list_splice_init(&hwbp_thread_list, &local_hwbp); spin_unlock_bh(&hwbp_thread_lock);
     spin_lock_bh(&hidden_vma_lock); list_splice_init(&hidden_vma_list, &local_vma); spin_unlock_bh(&hidden_vma_lock);
     spin_lock_bh(&uxn_lock); list_splice_init(&uxn_list, &local_uxn); spin_unlock_bh(&uxn_lock);
     spin_lock_bh(&hwbp_target_lock); list_splice_init(&hwbp_target_list, &local_target); spin_unlock_bh(&hwbp_target_lock);
     spin_lock_bh(&ledger_lock); list_splice_init(&ledger_list, &local_ledger); spin_unlock_bh(&ledger_lock);
 
-    /* 致命修复 4：等所有 RCU 读者安全退出隔离区 */
     synchronize_rcu();
 
-    /* 致命修复 5：在安全的隔离环境物理析构 */
     list_for_each_entry_safe(hnode, htmp, &local_hwbp, list) {
         perf_event_disable(hnode->bp_event);
         if (p_unregister_hwbp) p_unregister_hwbp(hnode->bp_event);
