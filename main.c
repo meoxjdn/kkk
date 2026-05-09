@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  main.c
- *    Description:  Ghost Core V10.6 Gateway Manager
+ *    Description:  Ghost Core V10.11 Gateway Manager (HWBP & Dummy FD Orchestrator)
  * =====================================================================================
  */
 #include <linux/module.h>
@@ -14,15 +14,16 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
-MODULE_DESCRIPTION("Ghost Core V10.6 Gateway");
+MODULE_DESCRIPTION("Ghost Core V10.11 Gateway");
 
 /* 
- * 极客网关：将来自用户态的 IOCTL 精准路由至 V10.6 核心物理引擎。
- * 负责严格的用户态内存跨界边界校验。
+ * 核心路由矩阵：负责用户态至内核态的边界防御与控制流中转
  */
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     switch (cmd) {
+        
+        /* 索敌探测阶段 */
         case IOCTL_CMD_GET_PID: {
             struct get_pid_req pid_req;
             if (copy_from_user(&pid_req, (void __user *)arg, sizeof(pid_req))) {
@@ -37,6 +38,7 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return ret;
         }
 
+        /* 内存拓扑解析阶段 */
         case IOCTL_CMD_GET_BASE: {
             struct module_base_req base_req;
             if (copy_from_user(&base_req, (void __user *)arg, sizeof(base_req))) {
@@ -51,24 +53,16 @@ static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return -ESRCH;
         }
 
-        case IOCTL_CMD_DEPLOY_SHADOW_PATCH: {
-            struct shadow_patch_req patch_req;
-            if (copy_from_user(&patch_req, (void __user *)arg, sizeof(patch_req))) {
-                return -EFAULT;
-            }
-            return handle_deploy_shadow_patch(&patch_req);
-        }
-
-        case IOCTL_CMD_HIDE_VMA: {
-            struct hide_vma_req hide_req;
-            if (copy_from_user(&hide_req, (void __user *)arg, sizeof(hide_req))) {
-                return -EFAULT;
-            }
-            return handle_hide_vma(&hide_req);
+        /* V10.11 HWBP 状态机与安全屋控制阶段 */
+        case IOCTL_SET_HWBP:
+        case IOCTL_PAUSE_HWBP:
+        case IOCTL_RESUME_HWBP: {
+            /* 将控制权平滑移交给 core_hook.c 的核心状态机枢纽 */
+            return handle_hwbp_ioctl(cmd, arg);
         }
 
         default:
-            pr_warn("[WuWa Gateway] Unknown IOCTL command received: 0x%x\n", cmd);
+            pr_warn("[Ghost Gateway] Unknown IOCTL vector intercepted: 0x%x\n", cmd);
             return -ENOTTY;
     }
 }
@@ -90,22 +84,22 @@ static struct miscdevice wuwa_misc = {
 static int __init wuwa_driver_init(void)
 {
     int ret;
-    pr_info("[WuWa] Booting V10.6 Zero-Footprint Gateway...\n");
+    pr_info("[Ghost Gateway] Booting V10.11 State-Machine Orchestrator...\n");
 
     ret = ghost_core_init_engine();
     if (ret < 0) {
-        pr_err("[WuWa] Failed to initialize Ghost Core Engine. Aborting.\n");
+        pr_err("[Ghost Gateway] Failed to ignite Core Engine. Aborting sequence.\n");
         return ret;
     }
     
     ret = misc_register(&wuwa_misc);
     if (ret < 0) {
         ghost_core_exit_engine();
-        pr_err("[WuWa] Failed to register misc device.\n");
+        pr_err("[Ghost Gateway] VFS device registration failed. Kernel locked.\n");
         return ret;
     }
 
-    pr_info("[WuWa] V10.6 Gateway Online. Listening on /dev/wuwa_core\n");
+    pr_info("[Ghost Gateway] Engine Online. IOCTL Router active on /dev/wuwa_core.\n");
     return 0;
 }
 
@@ -113,7 +107,7 @@ static void __exit wuwa_driver_exit(void)
 {
     misc_deregister(&wuwa_misc);
     ghost_core_exit_engine();
-    pr_info("[WuWa] Gateway Offline. System cleanly restored.\n");
+    pr_info("[Ghost Gateway] Gateway Offline. HWBP resources wiped. Trace erased.\n");
 }
 
 module_init(wuwa_driver_init);
