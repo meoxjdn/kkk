@@ -413,9 +413,49 @@ long handle_deploy_shadow_patch(struct shadow_patch_req *req)
     handle_hide_vma(&hide_req);
 
     ret = force_target_mmu_op(req->pid, 1, page_start, PAGE_SIZE);
-    if (ret != 0) goto err_rollback;
+if (ret != 0) goto err_rollback;
 
-    unode = kzalloc(sizeof(*unode), GFP_KERNEL);
+/* 强制置硬件 UXN 位，确保 CPU 触发 Instruction Abort */
+{
+    struct task_struct *tmp_task;
+    struct mm_struct *tmp_mm;
+    rcu_read_lock();
+    tmp_task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
+    if (tmp_task) get_task_struct(tmp_task);
+    rcu_read_unlock();
+    if (tmp_task) {
+        tmp_mm = get_task_mm(tmp_task);
+        if (tmp_mm) {
+            pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
+            mmap_write_lock(tmp_mm);
+            pgd = pgd_offset(tmp_mm, page_start);
+            if (!pgd_none(*pgd) && !pgd_bad(*pgd)) {
+                p4d = p4d_offset(pgd, page_start);
+                if (!p4d_none(*p4d)) {
+                    pud = pud_offset(p4d, page_start);
+                    if (!pud_none(*pud)) {
+                        pmd = pmd_offset(pud, page_start);
+                        if (!pmd_none(*pmd)) {
+                            ptep = pte_offset_map(pmd, page_start);
+                            if (ptep) {
+                                u64 pval = pte_val(*ptep);
+                                pval |= (1ULL << 54); // UXN
+                                set_pte_at(tmp_mm, page_start, ptep, __pte(pval));
+                                pte_unmap(ptep);
+                            }
+                        }
+                    }
+                }
+            }
+            flush_tlb_mm(tmp_mm);
+            mmap_write_unlock(tmp_mm);
+            mmput(tmp_mm);
+        }
+        put_task_struct(tmp_task);
+    }
+}
+
+unode = kzalloc(sizeof(*unode), GFP_KERNEL);
     if (!unode) { ret = -ENOMEM; goto err_rollback; }
     
     unode->pid = req->pid;
@@ -840,8 +880,8 @@ int ghost_core_init_engine(void)
         return -ENOMEM;
     }
 
-    get_random_bytes(&random_offset, sizeof(random_offset));
-    g_ghost_alloc_base = 0x6000000000ULL + ((uint64_t)random_offset & 0x000FFFFF000ULL);
+/* 使用固定基址，避免随机地址与系统保留区域冲突导致死机 */
+g_ghost_alloc_base = 0x6000000000ULL;
 
     krp_show_map.kp.symbol_name = "show_pid_map";
     krp_show_map.handler = ret_show_map;
