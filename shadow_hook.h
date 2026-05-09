@@ -1,16 +1,16 @@
+/*
+ * shadow_hook.h - Protocol & Data Structures for Ghost Core Gateway
+ */
 #ifndef _SHADOW_HOOK_H
 #define _SHADOW_HOOK_H
 
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-#define DBG_HOOK_HANDLED 0
-#define DBG_HOOK_ERROR   1
-
-/* 
- * 驱动通信协议 IOCTL 魔法字 (升级为 V10 标准) 
+/* ==========================================================
+ * 驱动通信协议 IOCTL 魔法字 (V10 标准)
  * 彻底废除 RAW_PATCH，全面转向物理维度控制
- */
+ * ========================================================== */
 #define GHOST_MAGIC 'G'
 
 #define IOCTL_CMD_ALLOC_GHOST   _IOWR(GHOST_MAGIC, 1, struct ghost_alloc_req)
@@ -19,6 +19,10 @@
 #define IOCTL_CMD_DISABLE_HWBP  _IOW(GHOST_MAGIC, 4, struct hwbp_req)
 #define IOCTL_CMD_ENABLE_HWBP   _IOW(GHOST_MAGIC, 5, struct hwbp_req)
 #define IOCTL_CMD_HIDE_VMA      _IOW(GHOST_MAGIC, 6, struct hide_vma_req)
+
+/* ==========================================================
+ * 用户态与内核态交互结构体
+ * ========================================================== */
 
 /* 幽灵内存分配请求 */
 struct ghost_alloc_req {
@@ -48,10 +52,9 @@ struct hide_vma_req {
     unsigned long end_va;
 };
 
-/* ---------------------------------------------------------
- * Core 模块暴露给 Main 网关的内部接口
- * 实现在 core_hook.c (即前述 Ghost Core V10 源码)
- * --------------------------------------------------------- */
+/* ==========================================================
+ * 引擎暴露给网关的内部接口 (跨文件链接)
+ * ========================================================== */
 extern int ghost_core_init_engine(void);
 extern void ghost_core_exit_engine(void);
 
