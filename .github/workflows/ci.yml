@@ -9,12 +9,13 @@ on:
 
 jobs:
   matrix-builder:
+    # 引用上述分离出的底层车间模版
     uses: ./.github/workflows/ddk-lkm.yml
     strategy:
+      # 阻断连锁失败：某一个碎片化内核编译失败，不影响其他成功版本的产物输出
       fail-fast: false
       matrix:
         kmi:
-          # 剔除了云端缺乏镜像支持的 5.4 版本，保留稳定支持的 GKI 矩阵
           - android12-5.10
           - android13-5.10
           - android13-5.15
