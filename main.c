@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  main.c
- *    Description:  Ghost Core V10.5 Gateway Manager
+ *    Description:  Ghost Core V10.6 Gateway Manager
  * =====================================================================================
  */
 #include <linux/module.h>
@@ -14,15 +14,29 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Reverse Engineering Expert");
-MODULE_DESCRIPTION("Ghost Core V10.5 Gateway");
+MODULE_DESCRIPTION("Ghost Core V10.6 Gateway");
 
 /* 
- * 极客网关：将来自用户态的 IOCTL 精准路由至 V10.5 核心物理引擎。
+ * 极客网关：将来自用户态的 IOCTL 精准路由至 V10.6 核心物理引擎。
  * 负责严格的用户态内存跨界边界校验。
  */
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     switch (cmd) {
+        case IOCTL_CMD_GET_PID: {
+            struct get_pid_req pid_req;
+            if (copy_from_user(&pid_req, (void __user *)arg, sizeof(pid_req))) {
+                return -EFAULT;
+            }
+            long ret = handle_get_pid(&pid_req);
+            if (ret == 0) {
+                if (copy_to_user((void __user *)arg, &pid_req, sizeof(pid_req))) {
+                    return -EFAULT;
+                }
+            }
+            return ret;
+        }
+
         case IOCTL_CMD_GET_BASE: {
             struct module_base_req base_req;
             if (copy_from_user(&base_req, (void __user *)arg, sizeof(base_req))) {
@@ -76,7 +90,7 @@ static struct miscdevice wuwa_misc = {
 static int __init wuwa_driver_init(void)
 {
     int ret;
-    pr_info("[WuWa] Booting V10.5 Zero-Footprint Gateway...\n");
+    pr_info("[WuWa] Booting V10.6 Zero-Footprint Gateway...\n");
 
     ret = ghost_core_init_engine();
     if (ret < 0) {
@@ -91,7 +105,7 @@ static int __init wuwa_driver_init(void)
         return ret;
     }
 
-    pr_info("[WuWa] V10.5 Gateway Online. Listening on /dev/wuwa_core\n");
+    pr_info("[WuWa] V10.6 Gateway Online. Listening on /dev/wuwa_core\n");
     return 0;
 }
 
