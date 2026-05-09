@@ -1,13 +1,9 @@
 /*
- * Ghost Core V10 - The Absolute Final Blueprint (Production Ready)
+ * core_hook.c - Ghost Core V10 Physics Subsystem
  * Architecture: AArch64
- * Status: V10 Deployed (Kretprobe Maps Truncation, Fast-Path IOCTL, Unified Ledger)
- * Author: 顶尖逆向架构师
  */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
@@ -16,8 +12,6 @@
 #include <linux/vmalloc.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
-#include <linux/uio.h>
-#include <linux/miscdevice.h>
 #include <linux/rculist.h>
 #include <linux/spinlock.h>
 #include <linux/perf_event.h>
@@ -31,46 +25,15 @@
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
+#include "shadow_hook.h"
 
 /* ==========================================================
- * 通信协议与硬编码权限
+ * 物理权限硬编码
  * ========================================================== */
-#define GHOST_MAGIC 'G'
-#define IOCTL_CMD_ALLOC_GHOST   _IOWR(GHOST_MAGIC, 1, struct ghost_alloc_req)
-#define IOCTL_CMD_SET_UXN_TRAP  _IOW(GHOST_MAGIC, 2, struct uxn_trap_req)
-#define IOCTL_CMD_SET_HWBP      _IOW(GHOST_MAGIC, 3, struct hwbp_req)
-#define IOCTL_CMD_DISABLE_HWBP  _IOW(GHOST_MAGIC, 4, struct hwbp_req)
-#define IOCTL_CMD_ENABLE_HWBP   _IOW(GHOST_MAGIC, 5, struct hwbp_req)
-#define IOCTL_CMD_HIDE_VMA      _IOW(GHOST_MAGIC, 6, struct hide_vma_req)
-
 #define GHOST_PTE_PXN (1ULL << 53)
 #define GHOST_PTE_RX_EL0 ((1ULL << 0) | (1ULL << 6) | (1ULL << 7) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11) | GHOST_PTE_PXN)
 
 #define PERF_EVENT_IOC_MODIFY_ATTRIBUTES _IOW('$', 11, struct perf_event_attr *)
-
-struct ghost_alloc_req {
-    unsigned long target_va;    
-    unsigned long size;         
-    void __user *bytecode;
-};
-
-struct uxn_trap_req {
-    pid_t pid;
-    unsigned long orig_page_va; 
-    unsigned long recomp_va;    
-    u32 offset_map[1024];       
-};
-
-struct hwbp_req {
-    pid_t tgid;
-    unsigned long target_addr;
-};
-
-struct hide_vma_req {
-    pid_t tgid;
-    unsigned long start_va;
-    unsigned long end_va;
-};
 
 /* ==========================================================
  * 全局数据结构与锁机制
@@ -172,7 +135,7 @@ asm(
  * 模块一：Maps 截断隐藏 (Kretprobe 缓冲区时光倒流)
  * ========================================================== */
 
-static long handle_hide_vma(struct hide_vma_req *req)
+long handle_hide_vma(struct hide_vma_req *req)
 {
     struct hidden_vma_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
     if (!node) return -ENOMEM;
@@ -197,7 +160,6 @@ static struct kretprobe krp_show_map;
 static int entry_show_map(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct show_map_data *data = (struct show_map_data *)ri->data;
-    /* 参数 0 永远是 seq_file 指针，这是 C++ / OOP 底层 this 指针传递的铁律 */
     data->m = (struct seq_file *)regs->regs[0];
     data->prev_count = data->m->count;
     return 0;
@@ -217,7 +179,6 @@ static int ret_show_map(struct kretprobe_instance *ri, struct pt_regs *regs)
     list_for_each_entry_rcu(node, &hidden_vma_list, list) {
         if (node->tgid == current->tgid) {
             snprintf(hex_feature, sizeof(hex_feature), "%lx-%lx", node->start_va, node->end_va);
-            /* 直接在最终渲染的序列化字符串中搜寻物理特征 */
             if (strnstr(m->buf + data->prev_count, hex_feature, m->count - data->prev_count)) {
                 should_hide = true;
                 break;
@@ -226,7 +187,6 @@ static int ret_show_map(struct kretprobe_instance *ri, struct pt_regs *regs)
     }
     rcu_read_unlock();
 
-    /* 物理级阅后即焚 */
     if (should_hide) {
         m->count = data->prev_count;
     }
@@ -262,7 +222,7 @@ static int inject_ghost_pte(struct mm_struct *mm, unsigned long va, void *kaddr)
     return 0;
 }
 
-static long handle_alloc_ghost(struct ghost_alloc_req *req)
+long handle_alloc_ghost(struct ghost_alloc_req *req)
 {
     void *kmem;
     unsigned long i;
@@ -346,7 +306,7 @@ static int handler_pre_notify_segfault(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-static long handle_set_uxn_trap(struct uxn_trap_req *req)
+long handle_set_uxn_trap(struct uxn_trap_req *req)
 {
     struct uxn_node *node = kzalloc(sizeof(*node), GFP_KERNEL);
     if (!node) return -ENOMEM;
@@ -501,7 +461,7 @@ static int handler_pre_do_exit(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-static long handle_set_hwbp(struct hwbp_req *req)
+long handle_set_hwbp(struct hwbp_req *req)
 {
     struct task_struct *g, *t;
     struct hwbp_target *tgt;
@@ -547,7 +507,7 @@ static long handle_set_hwbp(struct hwbp_req *req)
     return 0;
 }
 
-static long handle_hwbp_gate(struct hwbp_req *req, bool enable)
+long handle_hwbp_gate(struct hwbp_req *req, bool enable)
 {
     struct hwbp_thread_node *node;
     pid_t current_tid = current->pid;
@@ -682,7 +642,6 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned int cmd = regs->regs[1];
     
-    /* 极速装甲：O(1) 过滤，保护热路径性能 */
     if (unlikely(cmd == PERF_EVENT_IOC_MODIFY_ATTRIBUTES)) {
         unsigned long arg = regs->regs[2];
         struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)arg;
@@ -707,54 +666,11 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 }
 
 /* ==========================================================
- * IOCTL 网关与模块生命周期 (绝对排干卸载)
+ * 生命引擎：装载与绝对物理剥离
  * ========================================================== */
 
-static long ghost_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+int ghost_core_init_engine(void)
 {
-    struct ghost_alloc_req alloc_req;
-    struct uxn_trap_req trap_req;
-    struct hwbp_req hwbp_r;
-    struct hide_vma_req hide_req;
-
-    switch (cmd) {
-    case IOCTL_CMD_ALLOC_GHOST:
-        if (copy_from_user(&alloc_req, (void __user *)arg, sizeof(alloc_req))) return -EFAULT;
-        return handle_alloc_ghost(&alloc_req);
-    case IOCTL_CMD_SET_UXN_TRAP:
-        if (copy_from_user(&trap_req, (void __user *)arg, sizeof(trap_req))) return -EFAULT;
-        return handle_set_uxn_trap(&trap_req);
-    case IOCTL_CMD_SET_HWBP:
-        if (copy_from_user(&hwbp_r, (void __user *)arg, sizeof(hwbp_r))) return -EFAULT;
-        return handle_set_hwbp(&hwbp_r);
-    case IOCTL_CMD_DISABLE_HWBP:
-        if (copy_from_user(&hwbp_r, (void __user *)arg, sizeof(hwbp_r))) return -EFAULT;
-        return handle_hwbp_gate(&hwbp_r, false);
-    case IOCTL_CMD_ENABLE_HWBP:
-        if (copy_from_user(&hwbp_r, (void __user *)arg, sizeof(hwbp_r))) return -EFAULT;
-        return handle_hwbp_gate(&hwbp_r, true);
-    case IOCTL_CMD_HIDE_VMA:
-        if (copy_from_user(&hide_req, (void __user *)arg, sizeof(hide_req))) return -EFAULT;
-        return handle_hide_vma(&hide_req);
-    default: return -ENOTTY;
-    }
-}
-
-static const struct file_operations ghost_fops = {
-    .owner = THIS_MODULE, .unlocked_ioctl = ghost_ioctl,
-#ifdef CONFIG_COMPAT
-    .compat_ioctl = ghost_ioctl,
-#endif
-};
-
-static struct miscdevice ghost_miscdev = {
-    .minor = MISC_DYNAMIC_MINOR, .name = "ghost_core", .fops = &ghost_fops,
-};
-
-static int __init ghost_core_init(void)
-{
-    if (misc_register(&ghost_miscdev)) return -EINVAL;
-
     hwbp_tw_cache = kmem_cache_create("hwbp_tw_cache", sizeof(struct hwbp_tw_node), 0, SLAB_HWCACHE_ALIGN, NULL);
     if (!hwbp_tw_cache) return -ENOMEM;
     hwbp_tw_pool = mempool_create_slab_pool(64, hwbp_tw_cache);
@@ -775,7 +691,6 @@ static int __init ghost_core_init(void)
             } \
         } while(0)
 
-    /* Kretprobe 的特殊挂载法 */
     krp_show_map.kp.symbol_name = "show_pid_map";
     krp_show_map.handler = ret_show_map;
     krp_show_map.entry_handler = entry_show_map;
@@ -792,18 +707,17 @@ static int __init ghost_core_init(void)
     HOOK_KPROBE(kp_ptrace, "__arm64_sys_ptrace", "sys_ptrace", handler_pre_ptrace);
     HOOK_KPROBE(kp_perf_event_open, "__arm64_sys_perf_event_open", "sys_perf_event_open", handler_pre_perf_event_open);
     
-    /* 尝试挂载专属 IOCTL 优先保护热路径 */
     kp_sys_ioctl.symbol_name = "perf_event_ioctl";
     kp_sys_ioctl.pre_handler = handler_pre_sys_ioctl;
     if (register_kprobe(&kp_sys_ioctl) < 0) {
         HOOK_KPROBE(kp_sys_ioctl, "__arm64_sys_ioctl", "sys_ioctl", handler_pre_sys_ioctl);
     }
 
-    pr_info("[GhostCore V10] The Final Defense Grid Online.\n");
+    pr_info("[GhostCore V10 Engine] Core Physics Subsystem Initialized.\n");
     return 0;
 }
 
-static void __exit ghost_core_exit(void)
+void ghost_core_exit_engine(void)
 {
     struct hidden_vma_node *vnode, *vtmp;
     struct uxn_node *unode, *utmp;
@@ -814,7 +728,6 @@ static void __exit ghost_core_exit(void)
     struct list_head safe_cleanup_list;
     INIT_LIST_HEAD(&safe_cleanup_list);
 
-    /* 1. 切断探针 */
     unregister_kretprobe(&krp_show_map);
     unregister_kprobe(&kp_notify_segfault);
     unregister_kprobe(&kp_wake_up_new_task);
@@ -822,20 +735,15 @@ static void __exit ghost_core_exit(void)
     unregister_kprobe(&kp_ptrace);
     unregister_kprobe(&kp_perf_event_open);
     unregister_kprobe(&kp_sys_ioctl);
-    misc_deregister(&ghost_miscdev);
 
-    /* 2. 排干队列 */
     flush_scheduled_work();
 
-    /* 3. 锁内摘除节点 */
     spin_lock_bh(&hwbp_thread_lock);
     list_splice_init(&hwbp_thread_list, &safe_cleanup_list);
     spin_unlock_bh(&hwbp_thread_lock);
 
-    /* 4. 强等 RCU */
     synchronize_rcu();
 
-    /* 5. 绝对安全的物理剥离 */
     list_for_each_entry_safe(hnode, htmp, &safe_cleanup_list, list) {
         perf_event_disable(hnode->bp_event);
         unregister_hw_breakpoint(hnode->bp_event);
@@ -869,10 +777,5 @@ static void __exit ghost_core_exit(void)
     mempool_destroy(hwbp_tw_pool);
     kmem_cache_destroy(hwbp_tw_cache);
 
-    pr_info("[GhostCore V10] Teardown Completed 100%%. Goodbye.\n");
+    pr_info("[GhostCore V10 Engine] Resources safely drained.\n");
 }
-
-module_init(ghost_core_init);
-module_exit(ghost_core_exit);
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("顶尖逆向架构师");
