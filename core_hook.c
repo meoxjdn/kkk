@@ -131,10 +131,7 @@ struct hwbp_elastic_node {
 };
 
 /* 适配网关层的结构体前置声明，防止编译器警告 */
-struct get_pid_req {
-    char process_name[64];
-    pid_t pid;
-};
+
 
 static LIST_HEAD(hidden_vma_list);
 static DEFINE_SPINLOCK(hidden_vma_lock);
