@@ -1,3 +1,6 @@
+/*
+ * main.c - Ghost Core Gateway & Lifecycle Manager
+ */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -12,7 +15,7 @@ MODULE_DESCRIPTION("Android WuWa - Ghost Core V10 Gateway");
 
 /* 
  * 极客网关：将来自用户态的 IOCTL 精准路由至 V10 核心物理引擎。
- * 这里负责严格的用户态内存跨界校验 (copy_from_user)。
+ * 负责严格的用户态内存跨界校验 (copy_from_user)，将防御阵线前置。
  */
 static long wuwa_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -66,9 +69,10 @@ static const struct file_operations wuwa_fops = {
 #endif
 };
 
+/* 使用你原有的设备名以兼容上层工具链 */
 static struct miscdevice wuwa_misc = {
     .minor = MISC_DYNAMIC_MINOR,
-    .name  = "wuwa_core",   /* 保持你原有的设备名，避免用户态改代码 */
+    .name  = "wuwa_core",
     .fops  = &wuwa_fops,
 };
 
@@ -97,10 +101,10 @@ static int __init wuwa_driver_init(void)
 
 static void __exit wuwa_driver_exit(void)
 {
-    /* 先注销设备入口，阻断新的请求进入 */
+    /* 1. 先注销设备入口，阻断新的请求进入 */
     misc_deregister(&wuwa_misc);
     
-    /* 触发 V10 的绝对排干与安全卸载序列 */
+    /* 2. 触发 V10 的绝对排干与安全卸载序列 */
     ghost_core_exit_engine();
     
     pr_info("[WuWa] Gateway Offline. System cleanly restored.\n");
