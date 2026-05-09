@@ -1,6 +1,8 @@
 /*
- * core_hook.c - Ghost Core V10.2 (GKI 6.6 MMU Downgraded & Dynamically Resolved)
+ * core_hook.c - Ghost Core V10.3 (GKI 5.10 to 6.12 Universal Adaptation)
  * Architecture: AArch64
+ * Status: Production Ready (ABI Signature Fixed, Implicit Includes Resolved)
+ * Author: 顶尖逆向架构师
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -8,7 +10,9 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/mm.h>
+#include <linux/mman.h>     /* 修复: MAP_FIXED, PROT_READ 等缺失问题 */
 #include <linux/slab.h>
+#include <linux/vmalloc.h>  /* 修复: vzalloc, vfree 隐式声明与指针截断问题 */
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
 #include <linux/rculist.h>
@@ -28,9 +32,18 @@
 #include "dynamic_resolver.h"
 
 /* ==========================================================
+ * 物理权限硬编码
+ * ========================================================== */
+#define GHOST_PTE_PXN (1ULL << 53)
+#define GHOST_PTE_RX_EL0 ((1ULL << 0) | (1ULL << 6) | (1ULL << 7) | (3ULL << 8) | (1ULL << 10) | (1ULL << 11) | GHOST_PTE_PXN)
+
+#define PERF_EVENT_IOC_MODIFY_ATTRIBUTES _IOW('$', 11, struct perf_event_attr *)
+
+/* ==========================================================
  * 动态函数指针声明 (Dynamic Function Pointers)
  * ========================================================== */
-typedef int (*register_user_hw_breakpoint_t)(struct perf_event_attr *attr, perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
+/* 修复: 将返回类型严格更正为 struct perf_event *，防止 64 位系统下高 32 位指针截断引发 Panic */
+typedef struct perf_event *(*register_user_hw_breakpoint_t)(struct perf_event_attr *attr, perf_overflow_handler_t triggered, void *context, struct task_struct *tsk);
 typedef int (*modify_user_hw_breakpoint_t)(struct perf_event *bp, struct perf_event_attr *attr);
 typedef void (*unregister_hw_breakpoint_t)(struct perf_event *bp);
 typedef int (*task_work_add_t)(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode);
@@ -247,7 +260,6 @@ static long force_target_mmu_op(pid_t pid, int op, unsigned long addr, unsigned 
     init_task_work(&ctx.work, execute_parasitic_work);
 
     if (p_task_work_add(task, &ctx.work, TWA_RESUME) == 0) {
-        /* 唤醒目标线程强制其执行挂载的 task_work */
         wake_up_process(task);
         if (wait_for_completion_timeout(&ctx.done, msecs_to_jiffies(2000))) {
             ret = ctx.result;
@@ -419,7 +431,6 @@ static int install_hwbp_for_thread(struct task_struct *task, pid_t tgid, unsigne
     return 0;
 }
 
-/* 统一的分发 Worker */
 static void execute_install_hwbp(struct task_struct *task, pid_t tgid, unsigned long target_addr)
 {
     install_hwbp_for_thread(task, tgid, target_addr);
@@ -458,7 +469,6 @@ static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs)
                 en->target_addr = tgt->orig_entry;
                 en->task = new_task;
                 
-                /* 弹性降级决策 */
                 if (p_task_work_add) {
                     init_task_work(&en->t_work, task_work_elastic_hwbp);
                     p_task_work_add(new_task, &en->t_work, TWA_RESUME);
@@ -722,7 +732,7 @@ static int handler_pre_sys_ioctl(struct kprobe *p, struct pt_regs *regs)
 int ghost_core_init_engine(void)
 {
     if (ghost_resolver_init() < 0) {
-        pr_err("[GhostCore V10.1] Failed to initialize dynamic resolver.\n");
+        pr_err("[GhostCore V10.3] Failed to initialize dynamic resolver.\n");
         return -EINVAL;
     }
 
@@ -775,7 +785,7 @@ int ghost_core_init_engine(void)
         HOOK_KPROBE(kp_sys_ioctl, "__arm64_sys_ioctl", "sys_ioctl", handler_pre_sys_ioctl);
     }
 
-    pr_info("[GhostCore V10.1 Engine] Core Physics Subsystem Initialized. GKI 6.6 Adapted.\n");
+    pr_info("[GhostCore V10.3 Engine] Core Physics Subsystem Initialized. GKI 5.10-6.12 Adapted.\n");
     return 0;
 }
 
@@ -839,5 +849,5 @@ void ghost_core_exit_engine(void)
     mempool_destroy(hwbp_elastic_pool);
     kmem_cache_destroy(hwbp_elastic_cache);
 
-    pr_info("[GhostCore V10.1 Engine] Resources safely drained.\n");
+    pr_info("[GhostCore V10.3 Engine] Resources safely drained.\n");
 }
