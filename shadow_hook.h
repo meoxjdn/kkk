@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  shadow_hook.h
- *    Description:  Ghost Core Protocol Definitions (Split Architecture)
+ *    Description:  Ghost Core Protocol Definitions (Aligned & Unified)
  * =====================================================================================
  */
 #ifndef _SHADOW_HOOK_H
@@ -29,7 +29,7 @@ struct core_cmd_packet {
 #define CMD_HBP_INSTALL 0x5A5A1001
 #define CMD_HBP_CLEANUP 0x5A5A1002
 
-/* 暴露给 main.c 的底层引擎 API */
+/* 引擎生命周期与业务调度接口 */
 extern int ghost_core_init_engine(void);
 extern void ghost_core_exit_engine(void);
 extern int wuwa_install_perf_hbp(struct wuwa_hbp_req *req);
