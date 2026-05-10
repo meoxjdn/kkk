@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine (The Bridge Sniper Edition)
+ * Description:  Ghost Core Engine V10.40 (Pointer Redirection Masterpiece)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Pure Register Hijack, Full Cloak)
+ * Status:  Production Ready (Zero-Crash, PC Stepping, Full Cloak Restored)
  * Author:  顶尖逆向架构师
  * =====================================================================================
  */
@@ -35,13 +35,13 @@ MODULE_AUTHOR("Reverse Engineering Expert");
 #define OFF_KILL        0x33b2ffcULL
 #define OFF_DAMAGE      0x844f4d0ULL
 
-/* * 完美的整数桥接点：SCVTF S0, W19
- * 在此地址，FOV 仍是整数形态。 
+/* * FOV 指针劫持点：在 ADRP 指令处实施拦截
  */
-#define OFF_FOV         0x5453F50ULL  
+#define OFF_FOV         0x20CD348ULL  
 
-/* FOV 整数目标值 (会通过 SCVTF 转换为 5.0f，可根据喜好改为 4) */
-#define FOV_TARGET_INT  5
+/* * 目标重定向偏移：将 X8 强行指向存储 4.5f 的内存基址
+ */
+#define TARGET_PTR_OFF  0x14AAA48ULL
 
 #define MAX_BPS         160
 #define ARM64_MAX_HW_BPS 6
@@ -60,7 +60,7 @@ static int               g_maxhp_on   = 0;
 
 static DEFINE_MUTEX(g_bp_mutex);
 
-/* 假账本防线：完美的空记录 */
+/* 假账本防线：完美的空记录，向反作弊提供全空寄存器假象 */
 static struct user_hwdebug_state g_fake_ledger;
 
 #pragma pack(push, 8)
@@ -109,17 +109,24 @@ static int resolve_symbols_natively(void) {
     if (!ghost_kallsyms_lookup_name) {
         if (init_ghost_resolver() < 0) return -ENOSYS;
     }
+    
     fn_register = (reg_fn_t)ghost_kallsyms_lookup_name("register_user_hw_breakpoint");
     fn_unregister = (unreg_fn_t)ghost_kallsyms_lookup_name("unregister_hw_breakpoint");
     fn_nofault_read = (read_nofault_fn_t)ghost_kallsyms_lookup_name("copy_from_user_nofault");
-    if (!fn_nofault_read) fn_nofault_read = (read_nofault_fn_t)ghost_kallsyms_lookup_name("probe_kernel_read");
+    
+    if (!fn_nofault_read) {
+        fn_nofault_read = (read_nofault_fn_t)ghost_kallsyms_lookup_name("probe_kernel_read");
+    }
 
-    if (!fn_register || !fn_unregister || !fn_nofault_read) return -ENOSYS;
+    if (!fn_register || !fn_unregister || !fn_nofault_read) {
+        return -ENOSYS;
+    }
     return 0;
 }
 
 /* ==========================================================
- * 核心控制流路由 (The Immortal CFG Router)
+ * 核心控制流路由 (The Bulletproof CFG Router)
+ * 完美恢复堆栈平衡与控制流重定向
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc, base;
@@ -155,25 +162,27 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         
         if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
             if (flag == 1) { 
+                /* 己方攻击：模拟执行，不予拦截 */
                 regs->regs[19] = regs->regs[1]; 
                 regs->pc += 4; 
                 return;
             }
         }
         
+        /* 敌方攻击：补偿栈空间，免除伤害 */
         regs->sp += 0x30;
         regs->regs[0] = 0; 
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* * 5. 全屏 FOV (黄金桥接点)
-     * 在 SCVTF S0, W19 之前拦截。
-     * 直接修改整数寄存器 W19，然后放行！
-     * 严禁修改 PC，让 CPU 继续执行 SCVTF 完成浮点转换。
+    /* * 5. 全屏 FOV (指针重定向核心逻辑)
+     * 拦截 ADRP 指令，篡改目标地址寄存器 X8。
+     * 必须执行 PC += 4 越过原指令，否则篡改会被游戏引擎覆盖。
      */
     if (g_fov_on && pc == base + OFF_FOV) {
-        regs->regs[19] = FOV_TARGET_INT;
+        regs->regs[8] = base + TARGET_PTR_OFF;
+        regs->pc += 4; /* 跳过原本的 ADRP 指令，至关重要！ */
         return; 
     }
 }
@@ -184,6 +193,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr;
     struct perf_event     *bp;
+    
     hw_breakpoint_init(&attr);
     attr.bp_addr  = addr;
     attr.bp_len   = HW_BREAKPOINT_LEN_4;
@@ -193,6 +203,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     if (!fn_register) return NULL;
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
     if (IS_ERR(bp)) return NULL;
+    
     return bp;
 }
 
@@ -207,7 +218,10 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (!pid_struct) return -ESRCH;
 
     tsk = pid_task(pid_struct, PIDTYPE_PID);
-    if (!tsk) { put_pid(pid_struct); return -ESRCH; }
+    if (!tsk) { 
+        put_pid(pid_struct); 
+        return -ESRCH; 
+    }
 
     mutex_lock(&g_bp_mutex);
     if (g_bp_count == 0) {
@@ -220,15 +234,32 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
     }
 
-    if (g_bp_count + 5 >= MAX_BPS) goto unlock_out;
+    if (g_bp_count + 5 >= MAX_BPS) {
+        goto unlock_out;
+    }
 
     pr_info("[GhostCore] Securing Thread %d (Base: 0x%llx)...\n", req->tid, req->base_addr);
 
-    if (req->border_on) { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_BORDER); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->skip_on)   { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on)  { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_KILL); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->damage_on) { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_DAMAGE); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->fov_on)    { struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_FOV); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->border_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_BORDER); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->skip_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->maxhp_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_KILL); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->damage_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_DAMAGE); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->fov_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + OFF_FOV); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
 
 unlock_out:
     mutex_unlock(&g_bp_mutex);
@@ -252,8 +283,11 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 反作弊伪装矩阵：Kretprobe 楚门的世界
+ * 反作弊伪装矩阵：Kretprobe 幽灵拦截
+ * 包含深度越界对抗与无死锁的上下文分离
  * ========================================================== */
+
+/* 1. Ptrace 幽灵账本 */
 struct ptrace_stash {
     long request;
     long addr;
@@ -284,12 +318,16 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
     
     if (stash->addr == 0x402) { 
         if (copy_from_user(&iov, stash->data, sizeof(iov)) == 0) {
+            
             if (stash->request == PTRACE_SETREGSET) {
                 if (iov.iov_len > sizeof(struct user_hwdebug_state)) {
                     regs->regs[0] = -ENOSPC; 
                 } else {
-                    if (copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {}
+                    if (copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {
+                        /* Ignore */
+                    }
                     
+                    /* 深度防越界诱导 */
                     req_bps_count = g_fake_ledger.dbg_info & 0xFF;
                     if (req_bps_count > ARM64_MAX_HW_BPS) {
                         regs->regs[0] = -ENOSPC;
@@ -299,9 +337,12 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
                 }
             } 
             else if (stash->request == PTRACE_GETREGSET) {
-                if (copy_to_user(iov.iov_base, &g_fake_ledger, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {}
+                if (copy_to_user(iov.iov_base, &g_fake_ledger, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {
+                    /* Ignore */
+                }
                 regs->regs[0] = 0; 
             }
+            
         }
     }
     return 0;
@@ -315,14 +356,21 @@ static struct kretprobe krp_ptrace = {
     .maxactive      = 32,
 };
 
-static long dummy_perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) { return 0; }
+/* 2. Perf 虚拟空壳 FD */
+static long dummy_perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) { 
+    return 0; 
+}
+
 static ssize_t dummy_perf_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     uint64_t dummy = 0;
     if (count >= sizeof(uint64_t)) { 
-        if (copy_to_user(buf, &dummy, sizeof(uint64_t))) {}
+        if (copy_to_user(buf, &dummy, sizeof(uint64_t))) {
+            /* Ignore */
+        }
     }
     return 0;
 }
+
 static const struct file_operations dummy_perf_fops = { 
     .owner          = THIS_MODULE, 
     .unlocked_ioctl = dummy_perf_ioctl, 
@@ -349,13 +397,13 @@ static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *reg
 
 static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
-    struct perf_event_attr attr;
+    uint32_t attr_type;
     int dummy_fd;
 
     if (!stash->valid) return 0;
     
-    if (copy_from_user(&attr, stash->attr_uptr, sizeof(attr)) == 0) {
-        if (attr.type == PERF_TYPE_BREAKPOINT) {
+    if (fn_nofault_read(&attr_type, stash->attr_uptr, sizeof(uint32_t)) == 0) {
+        if (attr_type == PERF_TYPE_BREAKPOINT) {
             dummy_fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
             if (dummy_fd >= 0) {
                 regs->regs[0] = dummy_fd;
@@ -376,7 +424,7 @@ static struct kretprobe krp_perf = {
 };
 
 /* ==========================================================
- * VFS 通信网关
+ * VFS 通信网关注册
  * ========================================================== */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
@@ -387,7 +435,9 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
     if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
     
     if (pkt.cmd_id == CMD_HBP_INSTALL) {
-        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) return -EFAULT;
+        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) {
+            return -EFAULT;
+        }
         ret = wuwa_install_perf_hbp(&req);
         if (ret < 0) return ret;
     } 
@@ -415,7 +465,7 @@ static int __init ghost_core_init(void) {
     register_kretprobe(&krp_ptrace);
     register_kretprobe(&krp_perf);
     misc_register(&core_misc);
-    pr_info("[GhostCore V10.38] Bridge Sniper Edition Online. Full Cloak Active.\n");
+    pr_info("[GhostCore V10.40] Pointer Redirection Edition Online. Full Cloak Active.\n");
     return 0;
 }
 
@@ -424,7 +474,7 @@ static void __exit ghost_core_exit(void) {
     if (krp_perf.kp.addr) unregister_kretprobe(&krp_perf);
     wuwa_cleanup_perf_hbp();
     misc_deregister(&core_misc);
-    pr_info("[GhostCore V10.38] Matrices offline.\n");
+    pr_info("[GhostCore V10.40] Matrices offline.\n");
 }
 
 module_init(ghost_core_init);
