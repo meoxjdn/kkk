@@ -1,10 +1,10 @@
 /*
  * =====================================================================================
- *       Filename:  core.c
- *    Description:  Ghost Core Engine V10.38 (FPU-Decoupled Sentinel)
- *   Architecture:  AArch64 (ARMv8-A)
- *         Status:  Production Ready (Zero-Crash, FPU Excised, Full Kretprobe Cloak)
- *         Author:  顶尖逆向架构师
+ * Filename:  core.c
+ * Description:  Ghost Core Engine (The Bridge Sniper Edition)
+ * Architecture:  AArch64 (ARMv8-A)
+ * Status:  Production Ready (Zero-Crash, Pure Register Hijack, Full Cloak)
+ * Author:  顶尖逆向架构师
  * =====================================================================================
  */
 
@@ -34,12 +34,16 @@ MODULE_AUTHOR("Reverse Engineering Expert");
 #define OFF_PAUSE_JMP   0x53709a0ULL
 #define OFF_KILL        0x33b2ffcULL
 #define OFF_DAMAGE      0x844f4d0ULL
-#define OFF_FOV         0x9326F78ULL  
+
+/* * 完美的整数桥接点：SCVTF S0, W19
+ * 在此地址，FOV 仍是整数形态。 
+ */
+#define OFF_FOV         0x5453F50ULL  
+
+/* FOV 整数目标值 (会通过 SCVTF 转换为 5.0f，可根据喜好改为 4) */
+#define FOV_TARGET_INT  5
 
 #define MAX_BPS         160
-
-/* FOV 注入掩码 (4.5f) - 仅做 GPR 通用寄存器兜底 */
-#define FOV_TARGET_BITS 0x40900000ULL
 #define ARM64_MAX_HW_BPS 6
 
 /* ==========================================================
@@ -56,7 +60,7 @@ static int               g_maxhp_on   = 0;
 
 static DEFINE_MUTEX(g_bp_mutex);
 
-/* 假账本防线：完美的空记录，应对 Ptrace 探针 */
+/* 假账本防线：完美的空记录 */
 static struct user_hwdebug_state g_fake_ledger;
 
 #pragma pack(push, 8)
@@ -115,8 +119,7 @@ static int resolve_symbols_natively(void) {
 }
 
 /* ==========================================================
- * 核心控制流路由 (The Bulletproof CFG Router)
- * 彻底切除所有引发 Kernel Panic 的 FPU 浮点操作
+ * 核心控制流路由 (The Immortal CFG Router)
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc, base;
@@ -164,17 +167,14 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 5. 全屏 FOV (剔除 FPU 注入，仅拦截 GPR) */
+    /* * 5. 全屏 FOV (黄金桥接点)
+     * 在 SCVTF S0, W19 之前拦截。
+     * 直接修改整数寄存器 W19，然后放行！
+     * 严禁修改 PC，让 CPU 继续执行 SCVTF 完成浮点转换。
+     */
     if (g_fov_on && pc == base + OFF_FOV) {
-        /*
-         * 【架构师注】：硬件断点无法安全修改 S0 寄存器。
-         * 这里仅对 X0 通用寄存器做兜底修改。如果游戏出现黑屏，
-         * 说明该偏移处游戏强制读取 S0。你需要去 IDA 里往上回溯，
-         * 找一个用通用寄存器给 FOV 赋值的汇编地址作为新偏移。
-         */
-        regs->regs[0] = FOV_TARGET_BITS;
-        regs->pc = regs->regs[30];
-        return;
+        regs->regs[19] = FOV_TARGET_INT;
+        return; 
     }
 }
 
@@ -252,9 +252,8 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 反作弊伪装矩阵：Kretprobe 幽灵拦截
+ * 反作弊伪装矩阵：Kretprobe 楚门的世界
  * ========================================================== */
-
 struct ptrace_stash {
     long request;
     long addr;
@@ -291,7 +290,6 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
                 } else {
                     if (copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {}
                     
-                    /* 深度防越界诱导 */
                     req_bps_count = g_fake_ledger.dbg_info & 0xFF;
                     if (req_bps_count > ARM64_MAX_HW_BPS) {
                         regs->regs[0] = -ENOSPC;
@@ -351,13 +349,13 @@ static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *reg
 
 static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
-    uint32_t attr_type;
+    struct perf_event_attr attr;
     int dummy_fd;
 
     if (!stash->valid) return 0;
     
-    if (fn_nofault_read(&attr_type, stash->attr_uptr, sizeof(uint32_t)) == 0) {
-        if (attr_type == PERF_TYPE_BREAKPOINT) {
+    if (copy_from_user(&attr, stash->attr_uptr, sizeof(attr)) == 0) {
+        if (attr.type == PERF_TYPE_BREAKPOINT) {
             dummy_fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
             if (dummy_fd >= 0) {
                 regs->regs[0] = dummy_fd;
@@ -378,7 +376,7 @@ static struct kretprobe krp_perf = {
 };
 
 /* ==========================================================
- * VFS 通信网关注册
+ * VFS 通信网关
  * ========================================================== */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
@@ -417,7 +415,7 @@ static int __init ghost_core_init(void) {
     register_kretprobe(&krp_ptrace);
     register_kretprobe(&krp_perf);
     misc_register(&core_misc);
-    pr_info("[GhostCore V10.38] FPU-Decoupled Edition Online. Full Cloak Active.\n");
+    pr_info("[GhostCore V10.38] Bridge Sniper Edition Online. Full Cloak Active.\n");
     return 0;
 }
 
