@@ -244,60 +244,87 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct pid         *pid_struct;
     
     if (!req) {
+        pr_err("[GhostCore] install: null request\n");
         return -EINVAL;
     }
     
     if (resolve_symbols_natively() != 0) {
+        pr_err("[GhostCore] install: symbol resolution failed\n");
         return -ENOSYS;
     }
     
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct) {
+        pr_err("[GhostCore] install: cannot find pid for tid %d\n", req->tid);
         return -ESRCH;
     }
     
     tsk = pid_task(pid_struct, PIDTYPE_PID);
     if (!tsk) { 
+        pr_err("[GhostCore] install: no task for tid %d\n", req->tid);
         put_pid(pid_struct); 
         return -ESRCH; 
     }
 
     mutex_lock(&g_bp_mutex);
 
-    // ★ 修复：配置更新与断点计数解耦，每次请求都更新全局配置和基址
+    // ★ 关键修复：每次都无条件更新全局配置和基址，不再依赖 g_bp_count == 0
     g_game_base = req->base_addr;
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
 
-    // 同时清理旧断点，避免槽位被占用导致新功能安装失败
-    for (int i = 0; i < g_bp_count; i++) {
-        if (g_bps[i] && fn_unregister) {
-            fn_unregister(g_bps[i]);
-            g_bps[i] = NULL;
-        }
-    }
-    g_bp_count = 0;
+    pr_info("[GhostCore] Config updated: fov=%d, border=%d, skip=%d, damage=%d, maxhp=%d\n",
+            g_cfg.fov_on, g_cfg.border_on, g_cfg.skip_on, g_cfg.damage_on, g_cfg.maxhp_on);
 
-    // 重新安装新配置对应的断点
-    if (req->border_on) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); 
-        if (bp) g_bps[g_bp_count++] = bp; 
-    }
-    if (req->skip_on) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
-        if (bp) g_bps[g_bp_count++] = bp; 
-    }
-    if (req->maxhp_on) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
-        if (bp) g_bps[g_bp_count++] = bp; 
-    }
-    if (req->damage_on) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); 
-        if (bp) g_bps[g_bp_count++] = bp; 
-    }
-    if (req->fov_on) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); 
-        if (bp) g_bps[g_bp_count++] = bp; 
+    // 安装断点（如果槽位允许，且对应功能开启）
+    if (g_bp_count + 5 < MAX_BPS) {
+        if (req->border_on && !g_bps[g_bp_count]) { 
+            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); 
+            if (bp) {
+                g_bps[g_bp_count++] = bp;
+                pr_info("[GhostCore] Border bp installed at 0x%llx\n", req->base_addr + req->off_border);
+            } else {
+                pr_err("[GhostCore] Border bp install failed\n");
+            }
+        }
+        if (req->skip_on) { 
+            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
+            if (bp) {
+                g_bps[g_bp_count++] = bp;
+                pr_info("[GhostCore] Skip bp installed at 0x%llx\n", req->base_addr + req->off_pause_win);
+            } else {
+                pr_err("[GhostCore] Skip bp install failed\n");
+            }
+        }
+        if (req->maxhp_on) { 
+            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
+            if (bp) {
+                g_bps[g_bp_count++] = bp;
+                pr_info("[GhostCore] MaxHP bp installed at 0x%llx\n", req->base_addr + req->off_kill);
+            } else {
+                pr_err("[GhostCore] MaxHP bp install failed\n");
+            }
+        }
+        if (req->damage_on) { 
+            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); 
+            if (bp) {
+                g_bps[g_bp_count++] = bp;
+                pr_info("[GhostCore] Damage bp installed at 0x%llx\n", req->base_addr + req->off_damage);
+            } else {
+                pr_err("[GhostCore] Damage bp install failed\n");
+            }
+        }
+        if (req->fov_on) { 
+            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); 
+            if (bp) {
+                g_bps[g_bp_count++] = bp;
+                pr_info("[GhostCore] FOV bp installed at 0x%llx\n", req->base_addr + req->off_fov);
+            } else {
+                pr_err("[GhostCore] FOV bp install failed\n");
+            }
+        }
+    } else {
+        pr_warn("[GhostCore] BP slots exhausted or near limit, skip install\n");
     }
     
     mutex_unlock(&g_bp_mutex);
