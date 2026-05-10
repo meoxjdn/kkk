@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  *       Filename:  core.c
- *    Description:  Ghost Core Engine V10.37 (The Final Precision Payload)
+ *    Description:  Ghost Core Engine V10.38 (FPU-Decoupled Sentinel)
  *   Architecture:  AArch64 (ARMv8-A)
- *         Status:  Production Ready (Stack Unwinding Fixed, FPU Restored, Kretprobe)
+ *         Status:  Production Ready (Zero-Crash, FPU Excised, Full Kretprobe Cloak)
  *         Author:  顶尖逆向架构师
  * =====================================================================================
  */
@@ -20,9 +20,7 @@
 #include <linux/kprobes.h>
 #include <linux/anon_inodes.h>
 #include <linux/module.h>
-#include <linux/preempt.h>
 #include <asm/processor.h>
-#include <asm/fpsimd.h>
 #include <asm/ptrace.h>
 
 MODULE_LICENSE("GPL");
@@ -40,7 +38,7 @@ MODULE_AUTHOR("Reverse Engineering Expert");
 
 #define MAX_BPS         160
 
-/* 严格回调至 4.5f，确保广角视觉正常，消灭黑屏 */
+/* FOV 注入掩码 (4.5f) - 仅做 GPR 通用寄存器兜底 */
 #define FOV_TARGET_BITS 0x40900000ULL
 #define ARM64_MAX_HW_BPS 6
 
@@ -58,7 +56,7 @@ static int               g_maxhp_on   = 0;
 
 static DEFINE_MUTEX(g_bp_mutex);
 
-/* 假账本防线：完美的空记录 */
+/* 假账本防线：完美的空记录，应对 Ptrace 探针 */
 static struct user_hwdebug_state g_fake_ledger;
 
 #pragma pack(push, 8)
@@ -87,15 +85,11 @@ struct core_cmd_packet {
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void (*unreg_fn_t)(struct perf_event *);
 typedef long (*read_nofault_fn_t)(void *, const void __user *, size_t);
-typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
-typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 
 static reg_fn_t                 fn_register      = NULL;
 static unreg_fn_t               fn_unregister    = NULL;
 static read_nofault_fn_t        fn_nofault_read  = NULL;
-static fpsimd_save_fn_t         fn_fpsimd_save   = NULL;
-static fpsimd_load_fn_t         fn_fpsimd_load   = NULL;
 static kallsyms_lookup_name_t   ghost_kallsyms_lookup_name = NULL;
 
 static int init_ghost_resolver(void) {
@@ -115,18 +109,14 @@ static int resolve_symbols_natively(void) {
     fn_unregister = (unreg_fn_t)ghost_kallsyms_lookup_name("unregister_hw_breakpoint");
     fn_nofault_read = (read_nofault_fn_t)ghost_kallsyms_lookup_name("copy_from_user_nofault");
     if (!fn_nofault_read) fn_nofault_read = (read_nofault_fn_t)ghost_kallsyms_lookup_name("probe_kernel_read");
-    fn_fpsimd_save = (fpsimd_save_fn_t)ghost_kallsyms_lookup_name("fpsimd_save_state");
-    if (!fn_fpsimd_save) fn_fpsimd_save = (fpsimd_save_fn_t)ghost_kallsyms_lookup_name("fpsimd_save_and_flush_cpu_state");
-    fn_fpsimd_load = (fpsimd_load_fn_t)ghost_kallsyms_lookup_name("fpsimd_load_state");
-    if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)ghost_kallsyms_lookup_name("fpsimd_flush_cpu_state");
 
     if (!fn_register || !fn_unregister || !fn_nofault_read) return -ENOSYS;
     return 0;
 }
 
 /* ==========================================================
- * 核心控制流路由 (The Precision Payload CFG Router)
- * 完美恢复堆栈平衡与 FPU 上下文写入
+ * 核心控制流路由 (The Bulletproof CFG Router)
+ * 彻底切除所有引发 Kernel Panic 的 FPU 浮点操作
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc, base;
@@ -155,40 +145,34 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 4. 伤害无敌判定 (修复堆栈不平衡导致的闪退) */
+    /* 4. 伤害无敌判定 (栈帧极序解包) */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1C;
         
-        /* 内存探针判定：安全读取，规避缺页死机 */
         if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
             if (flag == 1) { 
-                /* 己方攻击：模拟执行被 Hook 的原始指令，放行不予修改 */
                 regs->regs[19] = regs->regs[1]; 
                 regs->pc += 4; 
                 return;
             }
         }
         
-        /* 敌方攻击：修改返回值免除伤害，必须解包极序堆栈补偿 0x30，防止外层函数读取乱码 LR */
         regs->sp += 0x30;
         regs->regs[0] = 0; 
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 5. 全屏 FOV (修复黑屏：恢复真实的 FPU 物理状态修改) */
+    /* 5. 全屏 FOV (剔除 FPU 注入，仅拦截 GPR) */
     if (g_fov_on && pc == base + OFF_FOV) {
-        preempt_disable(); /* 禁用抢占屏障，防止 FPU 状态机漂移 */
-        if (fn_fpsimd_save && fn_fpsimd_load) {
-            struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
-            fn_fpsimd_save(fp);
-            /* 安全修改 NEON 寄存器组 S0 */
-            fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
-            fn_fpsimd_load(fp);
-        }
-        regs->regs[0] = FOV_TARGET_BITS; /* 同步修改通用寄存器兜底 */
-        preempt_enable();
+        /*
+         * 【架构师注】：硬件断点无法安全修改 S0 寄存器。
+         * 这里仅对 X0 通用寄存器做兜底修改。如果游戏出现黑屏，
+         * 说明该偏移处游戏强制读取 S0。你需要去 IDA 里往上回溯，
+         * 找一个用通用寄存器给 FOV 赋值的汇编地址作为新偏移。
+         */
+        regs->regs[0] = FOV_TARGET_BITS;
         regs->pc = regs->regs[30];
         return;
     }
@@ -269,10 +253,8 @@ void wuwa_cleanup_perf_hbp(void) {
 
 /* ==========================================================
  * 反作弊伪装矩阵：Kretprobe 幽灵拦截
- * 包含深度越界对抗与无死锁的上下文分离
  * ========================================================== */
 
-/* 1. Ptrace 幽灵账本 */
 struct ptrace_stash {
     long request;
     long addr;
@@ -335,7 +317,6 @@ static struct kretprobe krp_ptrace = {
     .maxactive      = 32,
 };
 
-/* 2. Perf 虚拟空壳 FD */
 static long dummy_perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) { return 0; }
 static ssize_t dummy_perf_read(struct file *file, char __user *buf, size_t count, loff_t *pos) {
     uint64_t dummy = 0;
@@ -375,7 +356,6 @@ static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs)
 
     if (!stash->valid) return 0;
     
-    /* 采用 O(1) 前置探针安全读取 */
     if (fn_nofault_read(&attr_type, stash->attr_uptr, sizeof(uint32_t)) == 0) {
         if (attr_type == PERF_TYPE_BREAKPOINT) {
             dummy_fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
@@ -437,7 +417,7 @@ static int __init ghost_core_init(void) {
     register_kretprobe(&krp_ptrace);
     register_kretprobe(&krp_perf);
     misc_register(&core_misc);
-    pr_info("[GhostCore V10.37] The Final Precision Payload Online. Full Cloak Active.\n");
+    pr_info("[GhostCore V10.38] FPU-Decoupled Edition Online. Full Cloak Active.\n");
     return 0;
 }
 
@@ -446,7 +426,7 @@ static void __exit ghost_core_exit(void) {
     if (krp_perf.kp.addr) unregister_kretprobe(&krp_perf);
     wuwa_cleanup_perf_hbp();
     misc_deregister(&core_misc);
-    pr_info("[GhostCore V10.37] Matrices offline.\n");
+    pr_info("[GhostCore V10.38] Matrices offline.\n");
 }
 
 module_init(ghost_core_init);
