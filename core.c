@@ -263,34 +263,41 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     }
 
     mutex_lock(&g_bp_mutex);
-    
-    if (g_bp_count == 0) {
-        g_game_base = req->base_addr;
-        memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
-        memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
-    }
 
-    if (g_bp_count + 5 < MAX_BPS) {
-        if (req->border_on) { 
-            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); 
-            if (bp) g_bps[g_bp_count++] = bp; 
+    // ★ 修复：配置更新与断点计数解耦，每次请求都更新全局配置和基址
+    g_game_base = req->base_addr;
+    memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
+    memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
+
+    // 同时清理旧断点，避免槽位被占用导致新功能安装失败
+    for (int i = 0; i < g_bp_count; i++) {
+        if (g_bps[i] && fn_unregister) {
+            fn_unregister(g_bps[i]);
+            g_bps[i] = NULL;
         }
-        if (req->skip_on) { 
-            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
-            if (bp) g_bps[g_bp_count++] = bp; 
-        }
-        if (req->maxhp_on) { 
-            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
-            if (bp) g_bps[g_bp_count++] = bp; 
-        }
-        if (req->damage_on) { 
-            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); 
-            if (bp) g_bps[g_bp_count++] = bp; 
-        }
-        if (req->fov_on) { 
-            struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); 
-            if (bp) g_bps[g_bp_count++] = bp; 
-        }
+    }
+    g_bp_count = 0;
+
+    // 重新安装新配置对应的断点
+    if (req->border_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->skip_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->maxhp_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->damage_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); 
+        if (bp) g_bps[g_bp_count++] = bp; 
+    }
+    if (req->fov_on) { 
+        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); 
+        if (bp) g_bps[g_bp_count++] = bp; 
     }
     
     mutex_unlock(&g_bp_mutex);
