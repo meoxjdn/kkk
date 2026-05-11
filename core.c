@@ -29,6 +29,7 @@
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
 #include <linux/mman.h>
+#include <linux/mm.h> /* 必须引入以获取 PAGE_MASK 和 PAGE_SIZE */
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 
@@ -171,7 +172,7 @@ static int dummy_release(struct inode *inode, struct file *file) { return 0; }
 static const struct file_operations dummy_close_fops = { .release = dummy_release };
 
 /* ==========================================================
- * 底层工具 (修复 GKI 6.6 下 pte_mkwrite 参数变化)
+ * 底层工具 (修复 GKI 6.6 下内存页保护与对齐)
  * ========================================================== */
 /* 动态解析的函数指针 */
 static int (*dynamic_set_memory_rw)(unsigned long addr, int numpages) = NULL;
@@ -186,13 +187,20 @@ static void cloak_module(void) {
 }
 
 static void make_page_rw(unsigned long addr) {
-    if (dynamic_set_memory_rw)
-        dynamic_set_memory_rw(addr, 1);
+    if (dynamic_set_memory_rw) {
+        /* [架构师修正] 强制向下对齐至页边界，防止 PTE 计算越界引发死机 */
+        unsigned long page_start = addr & PAGE_MASK;
+        /* 放开连续两个内存页的写权限，防止系统调用表跨越页边界导致后半部分写入异常 */
+        dynamic_set_memory_rw(page_start, 2);
+    }
 }
 
 static void make_page_ro(unsigned long addr) {
-    if (dynamic_set_memory_ro)
-        dynamic_set_memory_ro(addr, 1);
+    if (dynamic_set_memory_ro) {
+        /* [架构师修正] 必须恢复相同范围的内存页属性 */
+        unsigned long page_start = addr & PAGE_MASK;
+        dynamic_set_memory_ro(page_start, 2);
+    }
 }
 
 /* ==========================================================
@@ -613,8 +621,8 @@ static int __init ghost_core_init(void) {
     g_real_perf_fops = (struct file_operations *)ghost_kallsyms("perf_fops");
     fn_copy_nofault  = (void *)ghost_kallsyms("copy_from_kernel_nofault");
     
-dynamic_set_memory_rw = (void *)ghost_kallsyms("set_memory_rw");
-dynamic_set_memory_ro = (void *)ghost_kallsyms("set_memory_ro");
+    dynamic_set_memory_rw = (void *)ghost_kallsyms("set_memory_rw");
+    dynamic_set_memory_ro = (void *)ghost_kallsyms("set_memory_ro");
 
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !g_sct || !g_real_perf_fops) return -ENOSYS;
