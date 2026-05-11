@@ -1,9 +1,10 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V20.1 (Android 12~15 / GKI Strict Compile Ready)
+ * Description:  Ghost Core Engine V20.1 (Android 15 / GKI 6.6 Kprobes Hook Ready)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Node, Syscall Routing, Kprobes Hook, Clone Tracking)
+ * Status:  Production Ready (Zero-Node, Syscall Routing, Live Mmap/Epoll, Clone Tracking)
+ * Author:  顶尖逆向架构师
  * =====================================================================================
  */
 
@@ -43,12 +44,46 @@ MODULE_LICENSE("GPL");
 #define MAP_PRIVATE 0x02
 #endif
 
+#ifndef __NR_epoll_ctl
+#define __NR_epoll_ctl       21
+#endif
+#ifndef __NR_epoll_pwait
+#define __NR_epoll_pwait     22
+#endif
+#ifndef __NR_ioctl
+#define __NR_ioctl           29
+#endif
+#ifndef __NR_close
+#define __NR_close           57
+#endif
+#ifndef __NR_read
+#define __NR_read            63
+#endif
+#ifndef __NR_ppoll
+#define __NR_ppoll           73
+#endif
+#ifndef __NR_ptrace
+#define __NR_ptrace          117
+#endif
+#ifndef __NR_getcpu
+#define __NR_getcpu          168
+#endif
+#ifndef __NR_clone
+#define __NR_clone           220
+#endif
+#ifndef __NR_mmap
+#define __NR_mmap            222
+#endif
+#ifndef __NR_perf_event_open
+#define __NR_perf_event_open 241
+#endif
+
 #define MAX_BPS          160
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 #define MAX_EPOLL_MAPS   32
 
-/* 维持 ABI 结构体绝对对齐，恢复 maxhp_on 与 off_kill */
+/* ABI 对齐结构体：完全恢复 off_kill 与 maxhp_on 字段 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -147,14 +182,17 @@ struct ghost_kprobe_hook {
     struct kprobe kp;
 };
 
+/* 安全透传宏：增加 orig_func 判空熔断，防止内联缺失导致空指针解引用 */
 #define CALL_ORIG(orig_func, regs) \
     ({ \
-        long _res; \
-        preempt_disable(); \
-        this_cpu_write(ghost_hook_active, true); \
-        _res = orig_func(regs); \
-        this_cpu_write(ghost_hook_active, false); \
-        preempt_enable(); \
+        long _res = -ENOSYS; \
+        if (likely(orig_func)) { \
+            preempt_disable(); \
+            this_cpu_write(ghost_hook_active, true); \
+            _res = orig_func(regs); \
+            this_cpu_write(ghost_hook_active, false); \
+            preempt_enable(); \
+        } \
         _res; \
     })
 
@@ -165,7 +203,6 @@ static int ghost_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs) {
         return 0; 
     }
     
-    /* 兼容 5.10 ~ 6.6 的通用指令指针修改方式 */
     regs->pc = (unsigned long)hook->function;
     return 1; 
 }
@@ -179,7 +216,7 @@ static void cloak_module(void) {
 }
 
 /* ==========================================================
- * 硬件断点生命周期 (完整恢复秒杀回调)
+ * 硬件断点生命周期 (完整恢复秒杀与锁血控制)
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; uint64_t base;
@@ -221,6 +258,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+    /* 完整补齐首次注入逻辑 */
     if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
@@ -240,7 +278,7 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 异步注入与拦截引擎 (补齐 Worker 线程挂载)
+ * 异步注入与克隆线程拦截 (完整作用域)
  * ========================================================== */
 
 static void inject_worker_handler(struct work_struct *w) {
@@ -255,6 +293,7 @@ static void inject_worker_handler(struct work_struct *w) {
             if (g_cfg.skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+            /* 完整补齐子线程挂载逻辑 */
             if (g_cfg.maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             mutex_unlock(&g_bp_mutex);
         }
@@ -263,23 +302,10 @@ static void inject_worker_handler(struct work_struct *w) {
     kfree(iw);
 }
 
-static asmlinkage long ghost_sys_clone(const struct pt_regs *regs) {
-    long ret_tid = CALL_ORIG(orig_clone, regs);
-    
-    if (ret_tid > 0 && g_target_tgid != 0 && current->tgid == g_target_tgid) {
-        struct inject_work *iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
-        if (iw) { 
-            iw->new_tid = ret_tid; 
-            INIT_WORK(&iw->work, inject_worker_handler); 
-            schedule_work(&iw->work); 
-        }
-    }
-    return ret_tid;
-}
-
 /* ==========================================================
  * 动态数据载荷引擎
  * ========================================================== */
+
 static inline bool is_ghost_fd(struct file *file, struct fake_perf_event **out_fake) {
     uint64_t magic = 0;
     if (file && file->f_op == g_real_perf_fops && file->private_data) {
@@ -344,8 +370,9 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
 }
 
 /* ==========================================================
- * VFS Hook：实时活体路由
+ * Syscall 伪装接管与动态路由
  * ========================================================== */
+
 static asmlinkage long ghost_sys_mmap(const struct pt_regs *regs) {
     unsigned long len = regs->regs[1];
     int fd = regs->regs[4];
@@ -531,6 +558,15 @@ static asmlinkage long ghost_sys_ioctl(const struct pt_regs *regs) {
     return CALL_ORIG(orig_ioctl, regs);
 }
 
+static asmlinkage long ghost_sys_clone(const struct pt_regs *regs) {
+    long ret_tid = CALL_ORIG(orig_clone, regs);
+    if (ret_tid > 0 && g_target_tgid != 0 && current->tgid == g_target_tgid) {
+        struct inject_work *iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
+        if (iw) { iw->new_tid = ret_tid; INIT_WORK(&iw->work, inject_worker_handler); schedule_work(&iw->work); }
+    }
+    return ret_tid;
+}
+
 static asmlinkage long ghost_sys_perf_event_open(const struct pt_regs *regs) {
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
     struct perf_event_attr attr;
@@ -595,7 +631,7 @@ static asmlinkage long ghost_sys_getcpu(const struct pt_regs *regs) {
 }
 
 /* ==========================================================
- * Kprobes 挂钩列表与生命周期
+ * Kprobes 挂钩列表与安全生命周期管理
  * ========================================================== */
 
 #define HOOK_SYSCALL(syscall_name, hook_func, orig_ptr) \
@@ -625,8 +661,11 @@ static int install_kprobe_hooks(void) {
         g_hooks[i].kp.symbol_name = g_hooks[i].name;
         g_hooks[i].kp.pre_handler = ghost_kprobe_pre_handler;
         
+        /* 增加对返回值判断：确保注册失败的符号不会引发盲跳 */
         if (register_kprobe(&g_hooks[i].kp) == 0) {
             *(g_hooks[i].original) = (void *)g_hooks[i].kp.addr;
+        } else {
+            *(g_hooks[i].original) = NULL;
         }
     }
     return 0;
@@ -635,6 +674,7 @@ static int install_kprobe_hooks(void) {
 static void uninstall_kprobe_hooks(void) {
     int i;
     for (i = 0; i < ARRAY_SIZE(g_hooks); i++) {
+        /* 基于内核分配的真实地址卸载，防止生命周期漏洞 */
         if (g_hooks[i].kp.addr) {
             unregister_kprobe(&g_hooks[i].kp);
         }
