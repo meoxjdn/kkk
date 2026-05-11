@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/kallsyms.h>
 #include <linux/syscalls.h>
 #include <linux/perf_event.h>
@@ -29,10 +30,9 @@
 #include <linux/poll.h>
 #include <linux/eventpoll.h>
 #include <linux/mman.h>
-#include <linux/mm.h> /* 必须引入以获取 PAGE_MASK 和 PAGE_SIZE */
+#include <linux/mm.h> /* 必须引入以获取 PAGE_MASK 等内存管理宏 */
 #include <asm/processor.h>
 #include <asm/ptrace.h>
-
 
 MODULE_LICENSE("GPL");
 
@@ -143,7 +143,6 @@ static atomic_t fake_perf_count = ATOMIC_INIT(0);
 static struct ghost_epoll_mapping g_epoll_maps[MAX_EPOLL_MAPS];
 static DEFINE_MUTEX(g_epoll_mutex);
 
-/* 修复类型不匹配：标准系统调用表应被视为 void* 数组 */
 static void **g_sct = NULL;
 static struct file_operations *g_real_perf_fops = NULL;
 
@@ -168,16 +167,16 @@ static unreg_fn_t             fn_unregister = NULL;
 static kallsyms_lookup_name_t ghost_kallsyms = NULL;
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
 
+/* 动态解析内存权限修改函数 */
+static int (*dynamic_set_memory_rw)(unsigned long addr, int numpages) = NULL;
+static int (*dynamic_set_memory_ro)(unsigned long addr, int numpages) = NULL;
+
 static int dummy_release(struct inode *inode, struct file *file) { return 0; }
 static const struct file_operations dummy_close_fops = { .release = dummy_release };
 
 /* ==========================================================
- * 底层工具 (修复 GKI 6.6 下内存页保护与对齐)
+ * 底层工具 (重构：使用官方 API 替代高风险 PTE 遍历)
  * ========================================================== */
-/* 动态解析的函数指针 */
-static int (*dynamic_set_memory_rw)(unsigned long addr, int numpages) = NULL;
-static int (*dynamic_set_memory_ro)(unsigned long addr, int numpages) = NULL;
-
 static void cloak_module(void) {
     struct module *mod = THIS_MODULE;
     if (mod && mod->list.next) {
@@ -188,16 +187,15 @@ static void cloak_module(void) {
 
 static void make_page_rw(unsigned long addr) {
     if (dynamic_set_memory_rw) {
-        /* [架构师修正] 强制向下对齐至页边界，防止 PTE 计算越界引发死机 */
+        /* [架构师修正] 强制向下对齐至页边界，防止错位引发 Kernel Panic */
         unsigned long page_start = addr & PAGE_MASK;
-        /* 放开连续两个内存页的写权限，防止系统调用表跨越页边界导致后半部分写入异常 */
+        /* 放开连续两个内存页的写权限，容错系统调用表跨页的情况 */
         dynamic_set_memory_rw(page_start, 2);
     }
 }
 
 static void make_page_ro(unsigned long addr) {
     if (dynamic_set_memory_ro) {
-        /* [架构师修正] 必须恢复相同范围的内存页属性 */
         unsigned long page_start = addr & PAGE_MASK;
         dynamic_set_memory_ro(page_start, 2);
     }
@@ -621,6 +619,7 @@ static int __init ghost_core_init(void) {
     g_real_perf_fops = (struct file_operations *)ghost_kallsyms("perf_fops");
     fn_copy_nofault  = (void *)ghost_kallsyms("copy_from_kernel_nofault");
     
+    /* 动态解析权限控制函数 */
     dynamic_set_memory_rw = (void *)ghost_kallsyms("set_memory_rw");
     dynamic_set_memory_ro = (void *)ghost_kallsyms("set_memory_ro");
 
@@ -642,7 +641,7 @@ static int __init ghost_core_init(void) {
     unsigned long sct_addr = (unsigned long)g_sct;
     make_page_rw(sct_addr);
     
-    /* 修复类型不匹配：统一强转为 void* 避开 Clang 指针严格检查 */
+    /* 避开 Clang 指针严格检查 */
     g_sct[__NR_ptrace]          = (void *)ghost_sys_ptrace;
     g_sct[__NR_perf_event_open] = (void *)ghost_sys_perf_event_open;
     g_sct[__NR_getcpu]          = (void *)ghost_sys_getcpu;
