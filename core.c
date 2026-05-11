@@ -11,7 +11,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/version.h>
 #include <linux/kallsyms.h>
 #include <linux/syscalls.h>
 #include <linux/perf_event.h>
@@ -32,9 +31,7 @@
 #include <linux/mman.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
-#include <asm/pgtable.h>
-#include <asm/tlbflush.h>
-#include <asm/current.h>
+
 
 MODULE_LICENSE("GPL");
 
@@ -176,6 +173,10 @@ static const struct file_operations dummy_close_fops = { .release = dummy_releas
 /* ==========================================================
  * 底层工具 (修复 GKI 6.6 下 pte_mkwrite 参数变化)
  * ========================================================== */
+/* 直接声明标准导出符号，避免 GKI 6.6 隐式函数声明警告 */
+extern int set_memory_rw(unsigned long addr, int numpages);
+extern int set_memory_ro(unsigned long addr, int numpages);
+
 static void cloak_module(void) {
     struct module *mod = THIS_MODULE;
     if (mod && mod->list.next) {
@@ -184,33 +185,12 @@ static void cloak_module(void) {
     }
 }
 
-static pte_t* get_pte_address(unsigned long addr) {
-    pgd_t *pgd = pgd_offset_k(addr); if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
-    p4d_t *p4d = p4d_offset(pgd, addr); if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
-    pud_t *pud = pud_offset(p4d, addr); if (pud_none(*pud) || pud_bad(*pud)) return NULL;
-    pmd_t *pmd = pmd_offset(pud, addr); if (pmd_none(*pmd) || pmd_bad(*pmd)) return NULL;
-    return pte_offset_kernel(pmd, addr);
-}
-
 static void make_page_rw(unsigned long addr) {
-    pte_t *pte = get_pte_address(addr);
-    if (pte) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-        /* 内核 6.4+ 强制要求无 vma 上下文时使用此变体 */
-        set_pte(pte, pte_mkwrite_novma(*pte));
-#else
-        set_pte(pte, pte_mkwrite(*pte));
-#endif
-        flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-    }
+    set_memory_rw(addr, 1);
 }
 
 static void make_page_ro(unsigned long addr) {
-    pte_t *pte = get_pte_address(addr);
-    if (pte) {
-        set_pte(pte, pte_wrprotect(*pte));
-        flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-    }
+    set_memory_ro(addr, 1);
 }
 
 /* ==========================================================
