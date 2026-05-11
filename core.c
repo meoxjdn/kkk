@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V10.41 (Universal Data-Driven Edition)
+ * Description:  Ghost Core Engine V10.42 (ROP Gadget Edition)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Dynamic Offsets, Full Cloak, Zero-Crash)
+ * Status:  Production Ready (ROP Slide, FPU-Safe, Zero-Crash)
  * Author:  顶尖逆向架构师
  * =====================================================================================
  */
@@ -40,16 +40,16 @@ struct wuwa_hbp_req {
     /* 动态特征偏移 */
     uint64_t off_border;
     uint64_t off_pause_win;
-    uint64_t off_pause_jmp;
+    uint64_t off_pause_jmp; /* [ROP专版] 此字段复用于传递 FMOV Gadget 地址 */
     uint64_t off_kill;
     uint64_t off_damage;
     uint64_t off_fov;
 
     /* FOV 动态执行策略 */
-    uint64_t fov_val;      /* 要写入的数值 (整数位模式 或 内存偏移) */
-    int      fov_reg;      /* 要修改的寄存器编号 (0=X0, 8=X8, 19=W19 等) */
-    int      fov_is_ptr;   /* 1=表示 fov_val 是偏移需加基址，0=直接写入数值 */
-    int      fov_pc_step;  /* PC处理：0=弹栈返回(LR)，1=跳过本指令(PC+=4)，2=原地放行 */
+    uint64_t fov_val;      /* 存放目标 FOV 的浮点十六进制值 (如 0x40900000) */
+    int      fov_reg;      
+    int      fov_is_ptr;   
+    int      fov_pc_step;  
 
     /* 业务开关 */
     int      fov_on;
@@ -137,7 +137,7 @@ static int resolve_symbols_natively(void) {
 }
 
 /* ==========================================================
- * 核心控制流路由 (Universal Data-Driven Router)
+ * 核心控制流路由 (ROP Gadget Router)
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc;
@@ -159,6 +159,8 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
     /* 2. 副本秒过 */
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) {
+        /* 注意：如果启用了 ROP，此处的 off_pause_jmp 会被当作 Gadget 地址。
+         * 在实际使用中，打决斗场时 skip_on 应为 0。 */
         regs->pc = base + g_cfg.off_pause_jmp;
         return;
     }
@@ -189,26 +191,15 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 5. 全屏 FOV 万能注入引擎 (动态控制寄存器与策略) */
+    /* 5. 终极 ROP Gadget 战术 (彻底绕过 FPU 与内存限制) */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) {
         
-        /* 核心修改模块：动态定位目标通用寄存器 */
-        if (g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
-            if (g_cfg.fov_is_ptr) {
-                regs->regs[g_cfg.fov_reg] = base + g_cfg.fov_val;
-            } else {
-                regs->regs[g_cfg.fov_reg] = g_cfg.fov_val;
-            }
-        }
-
-        /* 核心截断模块：动态控制流执行策略 */
-        if (g_cfg.fov_pc_step == 0) {
-            regs->pc = regs->regs[30]; /* 跳出并强行返回上一层 (LR) */
-        } 
-        else if (g_cfg.fov_pc_step == 1) {
-            regs->pc += 4;             /* 物理跳过当前原始指令，继续下行 */
-        } 
-        /* 策略为 2 时，完全不修改 PC，让 CPU 带着我们改好的寄存器自然执行原指令 */
+        /* [核心操作 1]：将目标浮点数的十六进制（如 0x40900000）装入通用寄存器 X0 */
+        regs->regs[0] = g_cfg.fov_val; 
+        
+        /* [核心操作 2]：拦截原指令，将控制流强行导向 FMOV S0, W0; RET 
+         * 此处利用 off_pause_jmp 传递用户态下发的 Gadget 地址 */
+        regs->pc = base + g_cfg.off_pause_jmp; 
         
         return; 
     }
@@ -244,87 +235,53 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct pid         *pid_struct;
     
     if (!req) {
-        pr_err("[GhostCore] install: null request\n");
         return -EINVAL;
     }
     
     if (resolve_symbols_natively() != 0) {
-        pr_err("[GhostCore] install: symbol resolution failed\n");
         return -ENOSYS;
     }
     
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct) {
-        pr_err("[GhostCore] install: cannot find pid for tid %d\n", req->tid);
         return -ESRCH;
     }
     
     tsk = pid_task(pid_struct, PIDTYPE_PID);
     if (!tsk) { 
-        pr_err("[GhostCore] install: no task for tid %d\n", req->tid);
         put_pid(pid_struct); 
         return -ESRCH; 
     }
 
     mutex_lock(&g_bp_mutex);
+    
+    if (g_bp_count == 0) {
+        g_game_base = req->base_addr;
+        memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
+        memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
+    }
 
-    // ★ 关键修复：每次都无条件更新全局配置和基址，不再依赖 g_bp_count == 0
-    g_game_base = req->base_addr;
-    memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
-    memset(&g_fake_ledger, 0, sizeof(g_fake_ledger));
-
-    pr_info("[GhostCore] Config updated: fov=%d, border=%d, skip=%d, damage=%d, maxhp=%d\n",
-            g_cfg.fov_on, g_cfg.border_on, g_cfg.skip_on, g_cfg.damage_on, g_cfg.maxhp_on);
-
-    // 安装断点（如果槽位允许，且对应功能开启）
     if (g_bp_count + 5 < MAX_BPS) {
-        if (req->border_on && !g_bps[g_bp_count]) { 
+        if (req->border_on) { 
             struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); 
-            if (bp) {
-                g_bps[g_bp_count++] = bp;
-                pr_info("[GhostCore] Border bp installed at 0x%llx\n", req->base_addr + req->off_border);
-            } else {
-                pr_err("[GhostCore] Border bp install failed\n");
-            }
+            if (bp) g_bps[g_bp_count++] = bp; 
         }
         if (req->skip_on) { 
             struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
-            if (bp) {
-                g_bps[g_bp_count++] = bp;
-                pr_info("[GhostCore] Skip bp installed at 0x%llx\n", req->base_addr + req->off_pause_win);
-            } else {
-                pr_err("[GhostCore] Skip bp install failed\n");
-            }
+            if (bp) g_bps[g_bp_count++] = bp; 
         }
         if (req->maxhp_on) { 
             struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
-            if (bp) {
-                g_bps[g_bp_count++] = bp;
-                pr_info("[GhostCore] MaxHP bp installed at 0x%llx\n", req->base_addr + req->off_kill);
-            } else {
-                pr_err("[GhostCore] MaxHP bp install failed\n");
-            }
+            if (bp) g_bps[g_bp_count++] = bp; 
         }
         if (req->damage_on) { 
             struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); 
-            if (bp) {
-                g_bps[g_bp_count++] = bp;
-                pr_info("[GhostCore] Damage bp installed at 0x%llx\n", req->base_addr + req->off_damage);
-            } else {
-                pr_err("[GhostCore] Damage bp install failed\n");
-            }
+            if (bp) g_bps[g_bp_count++] = bp; 
         }
         if (req->fov_on) { 
             struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); 
-            if (bp) {
-                g_bps[g_bp_count++] = bp;
-                pr_info("[GhostCore] FOV bp installed at 0x%llx\n", req->base_addr + req->off_fov);
-            } else {
-                pr_err("[GhostCore] FOV bp install failed\n");
-            }
+            if (bp) g_bps[g_bp_count++] = bp; 
         }
-    } else {
-        pr_warn("[GhostCore] BP slots exhausted or near limit, skip install\n");
     }
     
     mutex_unlock(&g_bp_mutex);
@@ -394,12 +351,10 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
                 if (iov.iov_len > sizeof(struct user_hwdebug_state)) {
                     regs->regs[0] = -ENOSPC;
                 } else {
-                    /* 静默分支消除编译器 __must_check 警告 */
                     if (copy_from_user(&g_fake_ledger, iov.iov_base, min_t(size_t, iov.iov_len, sizeof(struct user_hwdebug_state)))) {
                         /* Ignore failure */
                     }
                     
-                    /* 深度防越界陷阱校准 */
                     if ((g_fake_ledger.dbg_info & 0xFF) > ARM64_MAX_HW_BPS) {
                         regs->regs[0] = -ENOSPC;
                     } else {
@@ -479,7 +434,6 @@ static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs)
         return 0;
     }
     
-    /* 安全读取结构体开头的 type 字段 */
     if (fn_nofault_read(&attr.type, stash->attr_uptr, sizeof(uint32_t)) == 0) {
         if (attr.type == PERF_TYPE_BREAKPOINT) {
             fd = anon_inode_getfd("[fake_perf_hwbp]", &dummy_perf_fops, NULL, O_RDWR | O_CLOEXEC);
@@ -549,7 +503,7 @@ static int __init ghost_core_init(void) {
     register_kretprobe(&krp_perf);
     misc_register(&core_misc);
     
-    pr_info("[GhostCore V10.41] Universal Data-Driven Matrix Online.\n");
+    pr_info("[GhostCore V10.42] ROP Gadget Matrix Online. Full Cloak Active.\n");
     return 0;
 }
 
@@ -565,7 +519,7 @@ static void __exit ghost_core_exit(void) {
     wuwa_cleanup_perf_hbp(); 
     misc_deregister(&core_misc);
     
-    pr_info("[GhostCore V10.41] Matrices offline.\n");
+    pr_info("[GhostCore V10.42] Matrices offline.\n");
 }
 
 module_init(ghost_core_init);
