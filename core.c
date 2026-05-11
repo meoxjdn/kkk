@@ -1,10 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V20 (Android 15 / GKI 6.6 Ftrace Hook Ready)
+ * Description:  Ghost Core Engine V20.1 (Android 15 / GKI 6.6 Kprobes Hook Ready)
  * Architecture:  AArch64 (ARMv8-A)
  * Status:  Production Ready (Zero-Node, Syscall Routing, Live Mmap/Epoll, Clone Tracking)
- * Author:  顶尖逆向架构师
  * =====================================================================================
  */
 
@@ -31,14 +30,12 @@
 #include <linux/eventpoll.h>
 #include <linux/mman.h>
 #include <linux/percpu.h>
-#include <linux/ftrace.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
 
 MODULE_LICENSE("GPL");
 
-/* 兼容未暴露的内存映射宏 */
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS 0x20
 #endif
@@ -49,10 +46,9 @@ MODULE_LICENSE("GPL");
 #define MAX_BPS          160
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
-#define FTRACE_TEST_MAGIC 0xDEADBEEF
 #define MAX_EPOLL_MAPS   32
 
-/* 保持 ABI 结构体一致，防止上层 Controller 下发 Payload 时由于 Size 不匹配导致崩溃 */
+/* 维持 ABI 对齐 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -114,7 +110,6 @@ static DEFINE_MUTEX(g_epoll_mutex);
 
 static struct file_operations *g_real_perf_fops = NULL;
 
-/* Syscall 原函数指针 */
 static asmlinkage long (*orig_ptrace)(const struct pt_regs *);
 static asmlinkage long (*orig_perf_event_open)(const struct pt_regs *);
 static asmlinkage long (*orig_getcpu)(const struct pt_regs *);
@@ -140,17 +135,16 @@ static int dummy_release(struct inode *inode, struct file *file) { return 0; }
 static const struct file_operations dummy_close_fops = { .release = dummy_release };
 
 /* ==========================================================
- * Ftrace 核心挂钩引擎 (抗递归设计)
+ * Kprobes 核心接管引擎
  * ========================================================== */
 
 DEFINE_PER_CPU(bool, ghost_hook_active);
 
-struct ghost_ftrace_hook {
+struct ghost_kprobe_hook {
     const char *name;
     void *function;
     void **original;
-    unsigned long address;
-    struct ftrace_ops ops;
+    struct kprobe kp;
 };
 
 #define CALL_ORIG(orig_func, regs) \
@@ -164,18 +158,15 @@ struct ghost_ftrace_hook {
         _res; \
     })
 
-static void notrace ghost_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
-                                       struct ftrace_ops *ops, struct ftrace_regs *fregs)
-{
-    struct pt_regs *regs = ftrace_get_regs(fregs);
-    struct ghost_ftrace_hook *hook = container_of(ops, struct ghost_ftrace_hook, ops);
-
-    if (unlikely(this_cpu_read(ghost_hook_active)))
-        return;
-
-    /* 防御 NULL 寄存器上下文 (静默失效防御机制) */
-    if (regs)
-        regs->pc = (unsigned long)hook->function;
+static int ghost_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs) {
+    struct ghost_kprobe_hook *hook = container_of(p, struct ghost_kprobe_hook, kp);
+    
+    if (unlikely(this_cpu_read(ghost_hook_active))) {
+        return 0; 
+    }
+    
+    instruction_pointer_set(regs, (unsigned long)hook->function);
+    return 1; 
 }
 
 static void cloak_module(void) {
@@ -196,7 +187,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { regs->pc = base + g_cfg.off_pause_jmp; return; }
-    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         uint32_t flag = 0; uint64_t target = regs->regs[1] + 0x1C;
         if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { regs->regs[19] = regs->regs[1]; regs->pc += 4; return; }
@@ -223,16 +213,13 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     }
     
-    /* [修复] 全量补齐初始注入流程 */
     if (req->border_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
-    
-    mutex_unlock(&g_bp_mutex);
-    put_pid(pid_struct); return 0;
-}
+if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+
+mutex_unlock(&g_bp_mutex);
 
 void wuwa_cleanup_perf_hbp(void) {
     mutex_lock(&g_bp_mutex);
@@ -242,7 +229,7 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 核心挂钩与线程捕捉引擎 (异步架构)
+ * 异步注入与拦截
  * ========================================================== */
 
 static void inject_worker_handler(struct work_struct *w) {
@@ -253,14 +240,10 @@ static void inject_worker_handler(struct work_struct *w) {
         tsk = pid_task(pid_struct, PIDTYPE_PID);
         if (tsk && g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
             mutex_lock(&g_bp_mutex);
-            
-            /* [修复] 全量补齐克隆线程注入流程 */
             if (g_cfg.border_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_border); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
-            
             mutex_unlock(&g_bp_mutex);
         }
         put_pid(pid_struct);
@@ -283,7 +266,7 @@ static asmlinkage long ghost_sys_clone(const struct pt_regs *regs) {
 }
 
 /* ==========================================================
- * 动态数据载荷引擎 (复用 VFS Hook)
+ * 动态数据载荷引擎
  * ========================================================== */
 static inline bool is_ghost_fd(struct file *file, struct fake_perf_event **out_fake) {
     uint64_t magic = 0;
@@ -583,11 +566,6 @@ static asmlinkage long ghost_sys_ptrace(const struct pt_regs *regs) {
 
 static asmlinkage long ghost_sys_getcpu(const struct pt_regs *regs) {
     unsigned long cmd = regs ? regs->regs[0] : 0;
-    
-    /* 拦截 Ftrace 自身的存活性熔断探测 */
-    if (unlikely(cmd == FTRACE_TEST_MAGIC)) {
-        return -9999;
-    }
 
     if ((cmd & 0xFFFF0000) == 0x5A5A0000) {
         uint32_t real_cmd = cmd & 0xFFFF;
@@ -602,7 +580,7 @@ static asmlinkage long ghost_sys_getcpu(const struct pt_regs *regs) {
 }
 
 /* ==========================================================
- * 模块生命周期与 Ftrace 注册
+ * Kprobes 挂钩列表与生命周期
  * ========================================================== */
 
 #define HOOK_SYSCALL(syscall_name, hook_func, orig_ptr) \
@@ -612,7 +590,7 @@ static asmlinkage long ghost_sys_getcpu(const struct pt_regs *regs) {
         .original = (void **)(orig_ptr), \
     }
 
-static struct ghost_ftrace_hook g_hooks[] = {
+static struct ghost_kprobe_hook g_hooks[] = {
     HOOK_SYSCALL(sys_ptrace, ghost_sys_ptrace, &orig_ptrace),
     HOOK_SYSCALL(sys_perf_event_open, ghost_sys_perf_event_open, &orig_perf_event_open),
     HOOK_SYSCALL(sys_getcpu, ghost_sys_getcpu, &orig_getcpu),
@@ -626,52 +604,24 @@ static struct ghost_ftrace_hook g_hooks[] = {
     HOOK_SYSCALL(sys_epoll_pwait, ghost_sys_epoll_pwait, &orig_epoll_pwait),
 };
 
-static int install_ftrace_hooks(void) {
-    int err, i;
+static int install_kprobe_hooks(void) {
+    int i;
     for (i = 0; i < ARRAY_SIZE(g_hooks); i++) {
-        g_hooks[i].address = ghost_kallsyms(g_hooks[i].name);
-        if (!g_hooks[i].address) continue;
+        g_hooks[i].kp.symbol_name = g_hooks[i].name;
+        g_hooks[i].kp.pre_handler = ghost_kprobe_pre_handler;
         
-        *(g_hooks[i].original) = (void *)g_hooks[i].address;
-
-        g_hooks[i].ops.func = ghost_ftrace_thunk;
-        g_hooks[i].ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY;
-
-        err = ftrace_set_filter_ip(&g_hooks[i].ops, g_hooks[i].address, 0, 0);
-        if (err) continue;
-
-        err = register_ftrace_function(&g_hooks[i].ops);
-        if (err) {
-            ftrace_set_filter_ip(&g_hooks[i].ops, g_hooks[i].address, 1, 0);
+        if (register_kprobe(&g_hooks[i].kp) == 0) {
+            *(g_hooks[i].original) = (void *)g_hooks[i].kp.addr;
         }
     }
-
-    /* --- [修复] Ftrace REGS 上下文存活性熔断自检 --- */
-    if (g_hooks[2].address) { /* 锚定已 Hook 的 sys_getcpu */
-        struct pt_regs dummy_regs;
-        memset(&dummy_regs, 0, sizeof(dummy_regs));
-        dummy_regs.regs[0] = FTRACE_TEST_MAGIC;
-
-        typedef long (*sys_func_t)(const struct pt_regs *);
-        sys_func_t target_func = (sys_func_t)g_hooks[2].address;
-
-        /* 在内核态主动构造伪陷入 (Trap) 验证劫持流 */
-        long ret = target_func(&dummy_regs);
-        if (ret != -9999) {
-            /* 验证失败：上下文丢失，触发熔断，拒绝装载模块 */
-            return -ENODEV;
-        }
-    }
-
     return 0;
 }
 
-static void uninstall_ftrace_hooks(void) {
+static void uninstall_kprobe_hooks(void) {
     int i;
     for (i = 0; i < ARRAY_SIZE(g_hooks); i++) {
-        if (g_hooks[i].address) {
-            unregister_ftrace_function(&g_hooks[i].ops);
-            ftrace_set_filter_ip(&g_hooks[i].ops, g_hooks[i].address, 1, 0);
+        if (g_hooks[i].kp.addr) {
+            unregister_kprobe(&g_hooks[i].kp);
         }
     }
 }
@@ -695,18 +645,13 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !g_real_perf_fops) return -ENOSYS;
 
-    /* 加载拦截环并验证 REGS 存活性 */
-    if (install_ftrace_hooks() < 0) {
-        uninstall_ftrace_hooks();
-        return -ENODEV; 
-    }
-
+    install_kprobe_hooks();
     cloak_module();
     return 0;
 }
 
 static void __exit ghost_core_exit(void) {
-    uninstall_ftrace_hooks();
+    uninstall_kprobe_hooks();
     wuwa_cleanup_perf_hbp();
 }
 
