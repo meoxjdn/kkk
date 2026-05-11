@@ -191,14 +191,13 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 5. 终极 ROP Gadget 战术 (彻底绕过 FPU 与内存限制) */
+    /* 5. 终极合法入口 ROP 战术 */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) {
         
-        /* [核心操作 1]：将目标浮点数的十六进制（如 0x40900000）装入通用寄存器 X0 */
-        regs->regs[0] = g_cfg.fov_val; 
+        /* 极其关键：这次 X0 必须是一个内存地址（指针），所以要加上 base！ */
+        regs->regs[0] = base + g_cfg.fov_val; 
         
-        /* [核心操作 2]：拦截原指令，将控制流强行导向 FMOV S0, W0; RET 
-         * 此处利用 off_pause_jmp 传递用户态下发的 Gadget 地址 */
+        /* 引导 PC 跳向合法的函数入口，完美绕过 BTI 审查 */
         regs->pc = base + g_cfg.off_pause_jmp; 
         
         return; 
