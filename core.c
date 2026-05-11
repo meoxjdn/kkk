@@ -173,9 +173,9 @@ static const struct file_operations dummy_close_fops = { .release = dummy_releas
 /* ==========================================================
  * 底层工具 (修复 GKI 6.6 下 pte_mkwrite 参数变化)
  * ========================================================== */
-/* 直接声明标准导出符号，避免 GKI 6.6 隐式函数声明警告 */
-extern int set_memory_rw(unsigned long addr, int numpages);
-extern int set_memory_ro(unsigned long addr, int numpages);
+/* 动态解析的函数指针 */
+static int (*dynamic_set_memory_rw)(unsigned long addr, int numpages) = NULL;
+static int (*dynamic_set_memory_ro)(unsigned long addr, int numpages) = NULL;
 
 static void cloak_module(void) {
     struct module *mod = THIS_MODULE;
@@ -186,11 +186,13 @@ static void cloak_module(void) {
 }
 
 static void make_page_rw(unsigned long addr) {
-    set_memory_rw(addr, 1);
+    if (dynamic_set_memory_rw)
+        dynamic_set_memory_rw(addr, 1);
 }
 
 static void make_page_ro(unsigned long addr) {
-    set_memory_ro(addr, 1);
+    if (dynamic_set_memory_ro)
+        dynamic_set_memory_ro(addr, 1);
 }
 
 /* ==========================================================
@@ -610,6 +612,9 @@ static int __init ghost_core_init(void) {
     g_sct            = (void **)ghost_kallsyms("sys_call_table");
     g_real_perf_fops = (struct file_operations *)ghost_kallsyms("perf_fops");
     fn_copy_nofault  = (void *)ghost_kallsyms("copy_from_kernel_nofault");
+    
+dynamic_set_memory_rw = (void *)ghost_kallsyms("set_memory_rw");
+dynamic_set_memory_ro = (void *)ghost_kallsyms("set_memory_ro");
 
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !g_sct || !g_real_perf_fops) return -ENOSYS;
