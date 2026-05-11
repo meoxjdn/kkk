@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V20.1 (Android 15 / GKI 6.6 Kprobes Hook Ready)
+ * Description:  Ghost Core Engine V20.1 (Android 12~15 / GKI Strict Compile Ready)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Node, Syscall Routing, Live Mmap/Epoll, Clone Tracking)
+ * Status:  Production Ready (Zero-Node, Syscall Routing, Kprobes Hook, Clone Tracking)
  * =====================================================================================
  */
 
@@ -48,7 +48,7 @@ MODULE_LICENSE("GPL");
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 #define MAX_EPOLL_MAPS   32
 
-/* 维持 ABI 对齐 */
+/* 维持 ABI 结构体绝对对齐，恢复 maxhp_on 与 off_kill */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -165,7 +165,8 @@ static int ghost_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs) {
         return 0; 
     }
     
-    instruction_pointer_set(regs, (unsigned long)hook->function);
+    /* 兼容 5.10 ~ 6.6 的通用指令指针修改方式 */
+    regs->pc = (unsigned long)hook->function;
     return 1; 
 }
 
@@ -178,7 +179,7 @@ static void cloak_module(void) {
 }
 
 /* ==========================================================
- * 硬件断点生命周期
+ * 硬件断点生命周期 (完整恢复秒杀回调)
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; uint64_t base;
@@ -187,6 +188,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { regs->pc = base + g_cfg.off_pause_jmp; return; }
+    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         uint32_t flag = 0; uint64_t target = regs->regs[1] + 0x1C;
         if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { regs->regs[19] = regs->regs[1]; regs->pc += 4; return; }
@@ -204,8 +206,10 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
 
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct task_struct *tsk; struct pid *pid_struct;
-    pid_struct = find_get_pid(req->tid); if (!pid_struct) return -ESRCH;
-    tsk = pid_task(pid_struct, PIDTYPE_PID); if (!tsk) { put_pid(pid_struct); return -ESRCH; }
+    pid_struct = find_get_pid(req->tid); 
+    if (!pid_struct) return -ESRCH;
+    tsk = pid_task(pid_struct, PIDTYPE_PID); 
+    if (!tsk) { put_pid(pid_struct); return -ESRCH; }
 
     mutex_lock(&g_bp_mutex);
     if (g_bp_count == 0) {
@@ -217,19 +221,26 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
-
-mutex_unlock(&g_bp_mutex);
+    if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+    
+    mutex_unlock(&g_bp_mutex);
+    put_pid(pid_struct); return 0;
+}
 
 void wuwa_cleanup_perf_hbp(void) {
     mutex_lock(&g_bp_mutex);
-    for (int i = 0; i < g_bp_count; i++) { if (g_bps[i]) { if (fn_unregister) fn_unregister(g_bps[i]); g_bps[i] = NULL; } }
+    for (int i = 0; i < g_bp_count; i++) { 
+        if (g_bps[i]) { 
+            if (fn_unregister) fn_unregister(g_bps[i]); 
+            g_bps[i] = NULL; 
+        } 
+    }
     g_bp_count = 0; g_game_base = 0; g_target_tgid = 0;
     mutex_unlock(&g_bp_mutex);
 }
 
 /* ==========================================================
- * 异步注入与拦截
+ * 异步注入与拦截引擎 (补齐 Worker 线程挂载)
  * ========================================================== */
 
 static void inject_worker_handler(struct work_struct *w) {
@@ -244,6 +255,7 @@ static void inject_worker_handler(struct work_struct *w) {
             if (g_cfg.skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+            if (g_cfg.maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             mutex_unlock(&g_bp_mutex);
         }
         put_pid(pid_struct);
@@ -331,6 +343,9 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
     }
 }
 
+/* ==========================================================
+ * VFS Hook：实时活体路由
+ * ========================================================== */
 static asmlinkage long ghost_sys_mmap(const struct pt_regs *regs) {
     unsigned long len = regs->regs[1];
     int fd = regs->regs[4];
