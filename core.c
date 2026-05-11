@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V19 (GKI 6.6 / Android 15 Compilation Ready)
+ * Description:  Ghost Core Engine V20 (Android 15 / GKI 6.6 Strict Compile Ready)
  * Architecture:  AArch64 (ARMv8-A)
  * Status:  Production Ready (Zero-Node, Syscall Routing, Live Mmap/Epoll)
  * Author:  顶尖逆向架构师
@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/version.h>
 #include <linux/kallsyms.h>
 #include <linux/syscalls.h>
 #include <linux/perf_event.h>
@@ -45,23 +46,45 @@ MODULE_LICENSE("GPL");
 #define MAP_PRIVATE 0x02
 #endif
 
+/* 安全防御宏重复定义 */
+#ifndef __NR_epoll_ctl
+#define __NR_epoll_ctl       21
+#endif
+#ifndef __NR_epoll_pwait
+#define __NR_epoll_pwait     22
+#endif
+#ifndef __NR_ioctl
+#define __NR_ioctl           29
+#endif
+#ifndef __NR_close
+#define __NR_close           57
+#endif
+#ifndef __NR_read
+#define __NR_read            63
+#endif
+#ifndef __NR_ppoll
+#define __NR_ppoll           73
+#endif
+#ifndef __NR_ptrace
+#define __NR_ptrace          117
+#endif
+#ifndef __NR_getcpu
+#define __NR_getcpu          168
+#endif
+#ifndef __NR_clone
+#define __NR_clone           220
+#endif
+#ifndef __NR_mmap
+#define __NR_mmap            222
+#endif
+#ifndef __NR_perf_event_open
+#define __NR_perf_event_open 241
+#endif
+
 #define MAX_BPS          160
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 #define MAX_EPOLL_MAPS   32
-
-/* ARM64 Syscall Numbers */
-#define __NR_epoll_ctl       21
-#define __NR_epoll_pwait     22
-#define __NR_ioctl           29
-#define __NR_close           57
-#define __NR_read            63
-#define __NR_ppoll           73
-#define __NR_ptrace          117
-#define __NR_getcpu          168
-#define __NR_clone           220
-#define __NR_mmap            222
-#define __NR_perf_event_open 241
 
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
@@ -122,7 +145,8 @@ static atomic_t fake_perf_count = ATOMIC_INIT(0);
 static struct ghost_epoll_mapping g_epoll_maps[MAX_EPOLL_MAPS];
 static DEFINE_MUTEX(g_epoll_mutex);
 
-static unsigned long **g_sct = NULL;
+/* 修复类型不匹配：标准系统调用表应被视为 void* 数组 */
+static void **g_sct = NULL;
 static struct file_operations *g_real_perf_fops = NULL;
 
 static asmlinkage long (*orig_ptrace)(const struct pt_regs *);
@@ -150,7 +174,7 @@ static int dummy_release(struct inode *inode, struct file *file) { return 0; }
 static const struct file_operations dummy_close_fops = { .release = dummy_release };
 
 /* ==========================================================
- * 底层工具 (修复 set_pte_atomic)
+ * 底层工具 (修复 GKI 6.6 下 pte_mkwrite 参数变化)
  * ========================================================== */
 static void cloak_module(void) {
     struct module *mod = THIS_MODULE;
@@ -171,7 +195,12 @@ static pte_t* get_pte_address(unsigned long addr) {
 static void make_page_rw(unsigned long addr) {
     pte_t *pte = get_pte_address(addr);
     if (pte) {
-        *pte = pte_mkwrite(*pte);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+        /* 内核 6.4+ 强制要求无 vma 上下文时使用此变体 */
+        set_pte(pte, pte_mkwrite_novma(*pte));
+#else
+        set_pte(pte, pte_mkwrite(*pte));
+#endif
         flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
     }
 }
@@ -179,7 +208,7 @@ static void make_page_rw(unsigned long addr) {
 static void make_page_ro(unsigned long addr) {
     pte_t *pte = get_pte_address(addr);
     if (pte) {
-        *pte = pte_wrprotect(*pte);
+        set_pte(pte, pte_wrprotect(*pte));
         flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
     }
 }
@@ -237,7 +266,7 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 动态数据载荷引擎 (修复 copy_to_user 警告)
+ * 动态数据载荷引擎
  * ========================================================== */
 static inline bool is_ghost_fd(struct file *file, struct fake_perf_event **out_fake) {
     uint64_t magic = 0;
@@ -298,15 +327,12 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
 
         smp_wmb();
         header.data_head = head + h->size;
-        if (copy_to_user(fake->rb_user_addr, &header, sizeof(header))) {
-            /* 忽略写入失败 */
-            return;
-        }
+        if (copy_to_user(fake->rb_user_addr, &header, sizeof(header))) { /* ignore */ }
     }
 }
 
 /* ==========================================================
- * VFS Hook：移除 noinline，彻底适配 GKI 编译
+ * VFS Hook：实时活体路由
  * ========================================================== */
 
 static asmlinkage long ghost_sys_mmap(const struct pt_regs *regs) {
@@ -601,7 +627,7 @@ static int __init ghost_core_init(void) {
     if (init_ghost_resolver() < 0) return -ENOSYS;
     fn_register      = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
     fn_unregister    = (unreg_fn_t)ghost_kallsyms("unregister_hw_breakpoint");
-    g_sct            = (unsigned long **)ghost_kallsyms("sys_call_table");
+    g_sct            = (void **)ghost_kallsyms("sys_call_table");
     g_real_perf_fops = (struct file_operations *)ghost_kallsyms("perf_fops");
     fn_copy_nofault  = (void *)ghost_kallsyms("copy_from_kernel_nofault");
 
@@ -622,17 +648,20 @@ static int __init ghost_core_init(void) {
 
     unsigned long sct_addr = (unsigned long)g_sct;
     make_page_rw(sct_addr);
-    g_sct[__NR_ptrace]          = (unsigned long)ghost_sys_ptrace;
-    g_sct[__NR_perf_event_open] = (unsigned long)ghost_sys_perf_event_open;
-    g_sct[__NR_getcpu]          = (unsigned long)ghost_sys_getcpu;
-    g_sct[__NR_read]            = (unsigned long)ghost_sys_read;
-    g_sct[__NR_ioctl]           = (unsigned long)ghost_sys_ioctl;
-    g_sct[__NR_close]           = (unsigned long)ghost_sys_close;
-    g_sct[__NR_clone]           = (unsigned long)ghost_sys_clone;
-    g_sct[__NR_mmap]            = (unsigned long)ghost_sys_mmap;
-    g_sct[__NR_ppoll]           = (unsigned long)ghost_sys_ppoll;
-    g_sct[__NR_epoll_ctl]       = (unsigned long)ghost_sys_epoll_ctl;
-    g_sct[__NR_epoll_pwait]     = (unsigned long)ghost_sys_epoll_pwait;
+    
+    /* 修复类型不匹配：统一强转为 void* 避开 Clang 指针严格检查 */
+    g_sct[__NR_ptrace]          = (void *)ghost_sys_ptrace;
+    g_sct[__NR_perf_event_open] = (void *)ghost_sys_perf_event_open;
+    g_sct[__NR_getcpu]          = (void *)ghost_sys_getcpu;
+    g_sct[__NR_read]            = (void *)ghost_sys_read;
+    g_sct[__NR_ioctl]           = (void *)ghost_sys_ioctl;
+    g_sct[__NR_close]           = (void *)ghost_sys_close;
+    g_sct[__NR_clone]           = (void *)ghost_sys_clone;
+    g_sct[__NR_mmap]            = (void *)ghost_sys_mmap;
+    g_sct[__NR_ppoll]           = (void *)ghost_sys_ppoll;
+    g_sct[__NR_epoll_ctl]       = (void *)ghost_sys_epoll_ctl;
+    g_sct[__NR_epoll_pwait]     = (void *)ghost_sys_epoll_pwait;
+    
     make_page_ro(sct_addr);
 
     cloak_module();
@@ -643,17 +672,17 @@ static void __exit ghost_core_exit(void) {
     if (g_sct) {
         unsigned long sct_addr = (unsigned long)g_sct;
         make_page_rw(sct_addr);
-        g_sct[__NR_ptrace]          = (unsigned long)orig_ptrace;
-        g_sct[__NR_perf_event_open] = (unsigned long)orig_perf_event_open;
-        g_sct[__NR_getcpu]          = (unsigned long)orig_getcpu;
-        g_sct[__NR_read]            = (unsigned long)orig_read;
-        g_sct[__NR_ioctl]           = (unsigned long)orig_ioctl;
-        g_sct[__NR_close]           = (unsigned long)orig_close;
-        g_sct[__NR_clone]           = (unsigned long)orig_clone;
-        g_sct[__NR_mmap]            = (unsigned long)orig_mmap;
-        g_sct[__NR_ppoll]           = (unsigned long)orig_ppoll;
-        g_sct[__NR_epoll_ctl]       = (unsigned long)orig_epoll_ctl;
-        g_sct[__NR_epoll_pwait]     = (unsigned long)orig_epoll_pwait;
+        g_sct[__NR_ptrace]          = (void *)orig_ptrace;
+        g_sct[__NR_perf_event_open] = (void *)orig_perf_event_open;
+        g_sct[__NR_getcpu]          = (void *)orig_getcpu;
+        g_sct[__NR_read]            = (void *)orig_read;
+        g_sct[__NR_ioctl]           = (void *)orig_ioctl;
+        g_sct[__NR_close]           = (void *)orig_close;
+        g_sct[__NR_clone]           = (void *)orig_clone;
+        g_sct[__NR_mmap]            = (void *)orig_mmap;
+        g_sct[__NR_ppoll]           = (void *)orig_ppoll;
+        g_sct[__NR_epoll_ctl]       = (void *)orig_epoll_ctl;
+        g_sct[__NR_epoll_pwait]     = (void *)orig_epoll_pwait;
         make_page_ro(sct_addr);
     }
     wuwa_cleanup_perf_hbp();
