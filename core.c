@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V22.4 (Android 12~15 / Kretprobe + VFS Node Routing)
+ * Description:  Ghost Core Engine V23 (Android 12~15 / Kretprobe + Netlink Zero-Node)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Strict C90, HWBP Pool Fixed)
+ * Status:  Production Ready (Zero-Crash, Strict C90, Netlink Tunnel, Full Payload)
  * =====================================================================================
  */
 
@@ -25,7 +25,9 @@
 #include <linux/file.h>
 #include <linux/poll.h>
 #include <linux/mman.h>
-#include <linux/miscdevice.h>
+#include <linux/netlink.h>
+#include <net/sock.h>
+#include <net/net_namespace.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
@@ -36,8 +38,12 @@ MODULE_LICENSE("GPL");
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
+/* Netlink 通信魔术字与协议号对齐 */
+#define NETLINK_WUWA     2 /* NETLINK_USERSOCK */
 #define CMD_HBP_INSTALL  0x5A5A1001
 #define CMD_HBP_CLEANUP  0x5A5A1002
+
+static struct sock *wuwa_nl_sk = NULL;
 
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
@@ -118,6 +124,9 @@ static void cloak_module(void) {
     }
 }
 
+/* ==========================================================
+ * 硬件断点挂载与特征劫持
+ * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
@@ -128,7 +137,8 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc = regs->pc; 
     base = g_game_base;
 
-    pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx | Base: 0x%llx | Offset: 0x%llx\n", pc, base, pc - base);
+    /* 可选择注销探测日志，确保极致性能 */
+    /* pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx\n", pc); */
 
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { regs->pc = base + g_cfg.off_pause_jmp; return; }
@@ -163,10 +173,6 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     attr.disabled = 0;
     
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
-    
-    pr_info("[GhostCore] BP install attempt: addr=0x%llx tid=%d bp=%px IS_ERR=%ld\n",
-            addr, tsk->pid, bp, (long)PTR_ERR_OR_ZERO(bp));
-    
     return IS_ERR(bp) ? NULL : bp;
 }
 
@@ -188,7 +194,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     
-    /* [架构级修复] 解除全局资源饿死锁，变更为 MAX_BPS 阵列上限 */
     if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
@@ -214,6 +219,10 @@ void wuwa_cleanup_perf_hbp(void) {
     memset(&g_cfg, 0, sizeof(struct wuwa_hbp_req));
     mutex_unlock(&g_bp_mutex);
 }
+
+/* ==========================================================
+ * VFS 全功能高仿真 perf_event 文件操作集
+ * ========================================================== */
 
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
@@ -348,6 +357,10 @@ static const struct file_operations ghost_perf_fops = {
     .mmap           = ghost_perf_mmap,
 };
 
+/* ==========================================================
+ * Kretprobe 劫持与参数熔断拦截网
+ * ========================================================== */
+
 static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
@@ -456,7 +469,6 @@ static void inject_worker_handler(struct work_struct *w) {
         tsk = pid_task(pid_struct, PIDTYPE_PID);
         if (tsk && g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
             mutex_lock(&g_bp_mutex);
-            /* [架构级修复] 克隆线程同步解除饿死锁 */
             if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
@@ -482,34 +494,30 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     return 0;
 }
 
-static ssize_t cmd_channel_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
-    if (count == sizeof(struct wuwa_hbp_req)) {
-        struct wuwa_hbp_req req;
-        if (copy_from_user(&req, buf, sizeof(req)) == 0) {
-            wuwa_install_perf_hbp(&req);
-            return count;
+/* ==========================================================
+ * Netlink "零节点" 幽灵通信通道
+ * ========================================================== */
+static void ghost_nl_recv_msg(struct sk_buff *skb) {
+    struct nlmsghdr *nlh;
+    struct wuwa_hbp_req *req;
+    
+    if (!skb) return;
+    
+    nlh = (struct nlmsghdr *)skb->data;
+    
+    if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
+        if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
+            req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
+            wuwa_install_perf_hbp(req);
         }
-    } else if (count == 4) {
-        uint32_t magic = 0;
-        if (copy_from_user(&magic, buf, 4) == 0 && magic == CMD_HBP_CLEANUP) {
-            wuwa_cleanup_perf_hbp();
-            return count;
-        }
+    } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
+        wuwa_cleanup_perf_hbp();
     }
-    return -EINVAL;
 }
 
-static const struct file_operations cmd_fops = {
-    .owner = THIS_MODULE,
-    .write = cmd_channel_write,
-};
-
-static struct miscdevice cmd_device = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "logd_service",
-    .fops  = &cmd_fops,
-};
-
+/* ==========================================================
+ * 模块初始化与钩子注册
+ * ========================================================== */
 static struct kretprobe krp_perf = {
     .entry_handler = entry_handler_perf,
     .handler       = ret_handler_perf,
@@ -540,6 +548,10 @@ static int init_ghost_resolver(void) {
 }
 
 static int __init ghost_core_init(void) {
+    struct netlink_kernel_cfg nl_cfg;
+    memset(&nl_cfg, 0, sizeof(nl_cfg));
+    nl_cfg.input = ghost_nl_recv_msg;
+
     if (init_ghost_resolver() < 0) return -ENOSYS;
     
     fn_register   = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
@@ -549,8 +561,9 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
-    if (misc_register(&cmd_device) < 0) {
-        return -ENODEV;
+    wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
+    if (!wuwa_nl_sk) {
+        return -ENOMEM;
     }
 
     krp_perf.kp.symbol_name = "__arm64_sys_perf_event_open";
@@ -580,7 +593,9 @@ static void __exit ghost_core_exit(void) {
     if (krp_ptrace.kp.addr) unregister_kretprobe(&krp_ptrace);
     if (krp_clone.kp.addr) unregister_kretprobe(&krp_clone);
     
-    misc_deregister(&cmd_device);
+    if (wuwa_nl_sk) {
+        netlink_kernel_release(wuwa_nl_sk);
+    }
     
     wuwa_cleanup_perf_hbp();
 }
