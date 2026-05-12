@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V21 (Android 15 / Kretprobe + VFS Native Architecture)
+ * Description:  Ghost Core Engine V22 (Android 15 / Kretprobe + Netlink Zero-Node)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Argument Nullification, VFS Routing)
+ * Status:  Production Ready (Zero-Crash, Netlink Tunnel, VFS Routing)
  * =====================================================================================
  */
 
@@ -25,7 +25,9 @@
 #include <linux/file.h>
 #include <linux/poll.h>
 #include <linux/mman.h>
-#include <linux/miscdevice.h>
+#include <linux/netlink.h>
+#include <net/sock.h>
+#include <net/net_namespace.h>
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/current.h>
@@ -36,6 +38,14 @@ MODULE_LICENSE("GPL");
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
+/* Netlink 通信配置 */
+#define NETLINK_WUWA     NETLINK_USERSOCK
+#define CMD_HBP_INSTALL  0x5A5A1001
+#define CMD_HBP_CLEANUP  0x5A5A1002
+
+static struct sock *wuwa_nl_sk = NULL;
+
+/* 结构体严格对齐，全量功能保留 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -116,7 +126,7 @@ static void cloak_module(void) {
 }
 
 /* ==========================================================
- * 硬件断点生命周期管理
+ * 硬件断点挂载与秒杀回弹
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; uint64_t base;
@@ -445,36 +455,25 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 /* ==========================================================
- * 隐蔽命令通道 (Misc Device)
+ * Netlink "零节点" 幽灵通信通道
  * ========================================================== */
 
-static ssize_t cmd_channel_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) {
-    if (count == sizeof(struct wuwa_hbp_req)) {
-        struct wuwa_hbp_req req;
-        if (copy_from_user(&req, buf, sizeof(req)) == 0) {
-            wuwa_install_perf_hbp(&req);
-            return count;
+static void ghost_nl_recv_msg(struct sk_buff *skb) {
+    struct nlmsghdr *nlh;
+    
+    if (!skb) return;
+    
+    nlh = (struct nlmsghdr *)skb->data;
+    
+    if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
+        if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
+            struct wuwa_hbp_req *req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
+            wuwa_install_perf_hbp(req);
         }
-    } else if (count == 4) {
-        uint32_t magic = 0;
-        if (copy_from_user(&magic, buf, 4) == 0 && magic == 0x1002) {
-            wuwa_cleanup_perf_hbp();
-            return count;
-        }
+    } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
+        wuwa_cleanup_perf_hbp();
     }
-    return -EINVAL;
 }
-
-static const struct file_operations cmd_fops = {
-    .owner = THIS_MODULE,
-    .write = cmd_channel_write,
-};
-
-static struct miscdevice cmd_device = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "logd_service",
-    .fops  = &cmd_fops,
-};
 
 /* ==========================================================
  * 模块初始化与钩子注册
@@ -508,6 +507,10 @@ static int init_ghost_resolver(void) {
 }
 
 static int __init ghost_core_init(void) {
+    struct netlink_kernel_cfg nl_cfg = {
+        .input = ghost_nl_recv_msg,
+    };
+
     if (init_ghost_resolver() < 0) return -ENOSYS;
     
     fn_register   = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
@@ -517,7 +520,11 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
-    misc_register(&cmd_device);
+    /* 启动 Netlink 幽灵隧道 */
+    wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
+    if (!wuwa_nl_sk) {
+        return -ENOMEM;
+    }
 
     krp_perf.kp.symbol_name = "__arm64_sys_perf_event_open";
     if (register_kretprobe(&krp_perf) < 0) {
@@ -546,7 +553,10 @@ static void __exit ghost_core_exit(void) {
     if (krp_ptrace.kp.addr) unregister_kretprobe(&krp_ptrace);
     if (krp_clone.kp.addr) unregister_kretprobe(&krp_clone);
     
-    misc_deregister(&cmd_device);
+    if (wuwa_nl_sk) {
+        netlink_kernel_release(wuwa_nl_sk);
+    }
+    
     wuwa_cleanup_perf_hbp();
 }
 
