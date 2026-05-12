@@ -223,11 +223,12 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
 
-if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
-    regs->regs[0] = 1; 
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-    return; 
-}
+    /* 修正全屏黑边移除：返回 0 (False) 欺骗渲染器关闭裁剪 */
+    if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
+        regs->regs[0] = 0; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+        return; 
+    }
     
     /* 秒过跳转控制流，专享 off_pause_jmp */
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
@@ -235,18 +236,19 @@ if (g_cfg.border_on && pc == base + g_cfg.off_border) {
         return; 
     }
 
-if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    target = regs->regs[1] + 0x1C;
-    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-        regs->regs[19] = regs->regs[1]; 
-        regs->pc += 4; 
-        return; 
+    /* 修正致命的原子上下文崩溃，回滚为 fn_copy_nofault */
+    if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
+        target = regs->regs[1] + 0x1C;
+        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
+            regs->regs[19] = regs->regs[1]; 
+            regs->pc += 4; 
+            return; 
+        }
+        regs->sp += 0x30; 
+        regs->regs[0] = 0; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+        return;
     }
-    regs->sp += 0x30; 
-    regs->regs[0] = 0; 
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-    return;
-}
 
     /* 全屏秒杀 (maxhp_on) */
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
