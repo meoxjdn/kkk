@@ -115,9 +115,6 @@ struct inject_work {
     pid_t new_tid;
 };
 
-/* ==========================================================
- * 全局变量与探针（Kretprobe）声明区
- * ========================================================== */
 static int               g_target_tgid = 0;
 static uint64_t          g_game_base   = 0;
 static struct perf_event *g_bps[MAX_BPS];
@@ -129,10 +126,11 @@ static struct user_hwdebug_state g_fake_break_ledger;
 static struct user_hwdebug_state g_fake_watch_ledger;
 static atomic_t fake_perf_count = ATOMIC_INIT(0);
 
-/* 控制流劫持探针结构体 */
+/* --- 核心修复：补全 Kretprobe 探针实例声明 --- */
 static struct kretprobe krp_perf;
 static struct kretprobe krp_ptrace;
 static struct kretprobe krp_clone;
+/* --------------------------------------------- */
 
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void (*unreg_fn_t)(struct perf_event *);
@@ -696,23 +694,18 @@ static int __init ghost_core_init(void) {
         return -ENOMEM;
     }
 
-    /* ---------------------------------------------------------
-     * [修复区] 初始化并注册 kretprobe 钩子，完成控制流劫持
-     * --------------------------------------------------------- */
-     
-    /* 1. 劫持 perf_event_open (用于伪造硬件断点配额并防止反调试) */
+    /* --- 核心修复：绑定 Handler、配置 Maxactive、防止内核溢出 --- */
     memset(&krp_perf, 0, sizeof(krp_perf));
     krp_perf.entry_handler = entry_handler_perf;
     krp_perf.handler = ret_handler_perf;
     krp_perf.data_size = sizeof(struct perf_stash);
-    krp_perf.maxactive = 64; /* 允许高并发 Syscall */
+    krp_perf.maxactive = 64; 
     krp_perf.kp.symbol_name = "__arm64_sys_perf_event_open";
     if (register_kretprobe(&krp_perf) < 0) {
         krp_perf.kp.symbol_name = "sys_perf_event_open";
         register_kretprobe(&krp_perf);
     }
 
-    /* 2. 劫持 ptrace (用于过滤 PTRACE_GETREGSET/SETREGSET) */
     memset(&krp_ptrace, 0, sizeof(krp_ptrace));
     krp_ptrace.entry_handler = entry_handler_ptrace;
     krp_ptrace.handler = ret_handler_ptrace;
@@ -724,15 +717,15 @@ static int __init ghost_core_init(void) {
         register_kretprobe(&krp_ptrace);
     }
 
-    /* 3. 劫持 clone (跟踪新线程以自动下分布局断点) */
     memset(&krp_clone, 0, sizeof(krp_clone));
-    krp_clone.handler = clone_ret_handler; /* Clone 无需 entry_handler */
-    krp_clone.maxactive = 128; /* 线程创建可能会爆发，预留更多配额 */
+    krp_clone.handler = clone_ret_handler;
+    krp_clone.maxactive = 128; 
     krp_clone.kp.symbol_name = "__arm64_sys_clone";
     if (register_kretprobe(&krp_clone) < 0) {
         krp_clone.kp.symbol_name = "sys_clone";
         register_kretprobe(&krp_clone);
     }
+    /* ----------------------------------------------------------- */
 
     cloak_module();
     return 0;
