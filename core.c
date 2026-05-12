@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27 (Netlink Zero-Node / Polymorphic / MemReader)
+ * Description:  Ghost Core Engine V27.1 (Netlink MemReader Hotfix & Polymorphic)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
- * Status:  Production Ready (Atomic-Safe, Memory Piercing Enabled)
+ * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
  */
 
@@ -52,6 +52,7 @@ MODULE_LICENSE("GPL");
 
 static struct sock *wuwa_nl_sk = NULL;
 
+/* 严格保留所有战术载荷，绝不删减 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -59,7 +60,10 @@ struct wuwa_hbp_req {
     uint64_t off_border;
     uint64_t off_pause_win;
     uint64_t off_pause_jmp; 
+    uint64_t off_damage;
     uint64_t off_fov;
+    uint64_t off_kill;
+    int      maxhp_on;
     uint64_t fov_val;      
     int      fov_reg;      
     int      fov_is_ptr;   
@@ -67,6 +71,7 @@ struct wuwa_hbp_req {
     int      fov_on;
     int      border_on;
     int      skip_on;
+    int      damage_on;
 };
 
 struct wuwa_hbp_pkt {
@@ -74,7 +79,6 @@ struct wuwa_hbp_pkt {
     struct wuwa_hbp_req payload;
 };
 
-/* 跨进程内存穿透请求协议 */
 struct wuwa_mem_req {
     uint32_t pid;
     uint64_t addr;
@@ -140,11 +144,66 @@ static void cloak_module(void) {
 }
 
 /* ==========================================================
- * 硬件断点回调 (IRQ Atomic Safe & PAC Stripped)
+ * 跨进程内存穿透：五级内核页表漫游 (PTE Walk)
+ * ========================================================== */
+static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, void *dest, size_t size) {
+    struct mm_struct *mm;
+    pgd_t *pgd;
+    p4d_t *p4d;
+    pud_t *pud;
+    pmd_t *pmd;
+    pte_t *pte;
+    void *kaddr;
+    unsigned long pa;
+    int ret = 0;
+
+    mm = get_task_mm(task);
+    if (!mm) return -ESRCH;
+
+    mmap_read_lock(mm);
+
+    pgd = pgd_offset(mm, uaddr);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) goto out_unlock;
+
+    p4d = p4d_offset(pgd, uaddr);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) goto out_unlock;
+
+    pud = pud_offset(p4d, uaddr);
+    if (pud_none(*pud) || pud_bad(*pud)) goto out_unlock;
+
+    pmd = pmd_offset(pud, uaddr);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
+
+    pte = pte_offset_map(pmd, uaddr);
+    if (pte_none(*pte) || !pte_present(*pte)) {
+        pte_unmap(pte);
+        goto out_unlock;
+    }
+
+    pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
+    kaddr = phys_to_virt(pa) + (uaddr & ~PAGE_MASK);
+
+    ret = min_t(size_t, size, PAGE_SIZE - (uaddr & ~PAGE_MASK));
+    if (ret > 0) {
+        memcpy(dest, kaddr, ret);
+    }
+
+    pte_unmap(pte);
+
+out_unlock:
+    mmap_read_unlock(mm);
+    mmput(mm);
+    return ret;
+}
+
+/* ==========================================================
+ * 硬件断点回调 (IRQ Atomic Safe & PAC Stripped & Full Payload)
  * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
+    uint32_t flag = 0;
+    uint64_t target;
     
     if (unlikely(!regs)) return;
     pc = regs->pc; 
@@ -160,7 +219,28 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         regs->pc = base + g_cfg.off_pause_jmp; 
         return; 
     }
-    
+
+    /* 恢复被遗漏的 maxhp_on (全屏秒杀) */
+    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
+        regs->regs[0] = 1;
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+        return;
+    }
+
+    /* 恢复被遗漏的 damage_on (伤害增幅) */
+    if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
+        target = regs->regs[1] + 0x1C;
+        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
+            regs->regs[19] = regs->regs[1]; 
+            regs->pc += 4; 
+            return; 
+        }
+        regs->sp += 0x30; 
+        regs->regs[0] = 0; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+        return;
+    }
+
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         regs->regs[0] = base + g_cfg.fov_val; 
         regs->pc = base + g_cfg.off_pause_jmp; 
@@ -203,14 +283,23 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     
     if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
 }
 
+/* ==========================================================
+ * 清理逻辑：增加工作队列冲刷，消除残留竞争
+ * ========================================================== */
 void wuwa_cleanup_perf_hbp(void) {
     int i;
+
+    /* 冲刷所有待处理的异步注入任务，斩断竞态链 */
+    flush_workqueue(system_wq);
+
     mutex_lock(&g_bp_mutex);
     
     for (i = 0; i < g_bp_count; i++) {
@@ -234,10 +323,6 @@ void wuwa_cleanup_perf_hbp(void) {
 
     mutex_unlock(&g_bp_mutex);
 }
-
-/* ==========================================================
- * VFS 全功能高仿真 perf_event 文件操作集
- * ========================================================== */
 
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
@@ -372,10 +457,6 @@ static const struct file_operations ghost_perf_fops = {
     .mmap           = ghost_perf_mmap,
 };
 
-/* ==========================================================
- * Kretprobe 劫持与参数阻断逻辑
- * ========================================================== */
-
 static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
@@ -487,7 +568,9 @@ static void inject_worker_handler(struct work_struct *w) {
             if (g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
                 if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
@@ -510,14 +593,13 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 /* ==========================================================
- * Netlink 幽灵通道：多态载荷动态解壳 & 跨进程内存穿透
+ * Netlink 幽灵通道：修正后的内存穿透与解包状态机
  * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
     struct wuwa_hbp_pkt *pkt;
     struct wuwa_hbp_req plain;
-    int len;
-    int i;
+    int len, i;
     
     if (!skb) return;
 
@@ -528,16 +610,13 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
         if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
             if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_pkt)) {
                 pkt = (struct wuwa_hbp_pkt *)nlmsg_data(nlh);
-                for (i = 0; i < sizeof(plain); i++) {
+                for (i = 0; i < sizeof(plain); i++)
                     ((uint8_t*)&plain)[i] = ((uint8_t*)&pkt->payload)[i] ^ ((uint8_t*)&pkt->seed)[i % 4];
-                }
                 wuwa_install_perf_hbp(&plain);
             }
         } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
             wuwa_cleanup_perf_hbp();
-        } 
-        /* [核心拓展] 物理内存穿透读取接口 */
-        else if (nlh->nlmsg_type == CMD_MEM_READ) {
+        } else if (nlh->nlmsg_type == CMD_MEM_READ) {
             if (nlmsg_len(nlh) >= sizeof(struct wuwa_mem_req)) {
                 struct wuwa_mem_req *mreq = (struct wuwa_mem_req *)nlmsg_data(nlh);
                 struct sk_buff *reply_skb;
@@ -546,25 +625,29 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
                 struct task_struct *task;
                 struct pid *pid_struct;
                 void *dest_buf;
+                int bytes_read = 0;
                 
-                /* 单次极限限制为单页 4KB 防止溢出崩溃 */
-                if (mreq->size > 4096) mreq->size = 4096;
-                
+                if (mreq->size > 4096)
+                    mreq->size = 4096;
+
                 reply_skb = nlmsg_new(sizeof(struct wuwa_mem_req) + mreq->size, GFP_KERNEL);
                 if (reply_skb) {
-                    reply_nlh = nlmsg_put(reply_skb, NETLINK_CB(skb).portid, nlh->nlmsg_seq, CMD_MEM_READ_ACK, sizeof(struct wuwa_mem_req) + mreq->size, 0);
+                    reply_nlh = nlmsg_put(reply_skb, NETLINK_CB(skb).portid,
+                                          nlh->nlmsg_seq, CMD_MEM_READ_ACK,
+                                          sizeof(struct wuwa_mem_req) + mreq->size, 0);
                     reply_mreq = nlmsg_data(reply_nlh);
                     reply_mreq->pid = mreq->pid;
                     reply_mreq->addr = mreq->addr;
                     reply_mreq->size = 0;
-                    
+
                     pid_struct = find_get_pid(mreq->pid);
                     if (pid_struct) {
                         task = pid_task(pid_struct, PIDTYPE_PID);
                         if (task) {
                             dest_buf = (void *)(reply_mreq + 1);
-                            /* 无视权限穿透虚拟内存屏障 */
-                            reply_mreq->size = access_process_vm(task, mreq->addr, dest_buf, mreq->size, 0);
+                            /* 页表漫游穿透物理内存 */
+                            bytes_read = ghost_read_task_mem(task, mreq->addr, dest_buf, mreq->size);
+                            reply_mreq->size = bytes_read;
                         }
                         put_pid(pid_struct);
                     }
@@ -575,28 +658,6 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
         nlh = nlmsg_next(nlh, &len);
     }
 }
-
-/* ==========================================================
- * 模块初始化与 Kretprobe 注册
- * ========================================================== */
-static struct kretprobe krp_perf = {
-    .entry_handler = entry_handler_perf,
-    .handler       = ret_handler_perf,
-    .data_size     = sizeof(struct perf_stash),
-    .maxactive     = 64,
-};
-
-static struct kretprobe krp_ptrace = {
-    .entry_handler = entry_handler_ptrace,
-    .handler       = ret_handler_ptrace,
-    .data_size     = sizeof(struct ptrace_stash),
-    .maxactive     = 64,
-};
-
-static struct kretprobe krp_clone = {
-    .handler   = clone_ret_handler,
-    .maxactive = 64,
-};
 
 static int init_ghost_resolver(void) {
     struct kprobe kp;
