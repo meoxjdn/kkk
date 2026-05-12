@@ -238,7 +238,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     /* 恢复被遗漏的 damage_on (伤害增幅) */
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         target = regs->regs[1] + 0x1C;
-        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
+        if (probe_kernel_read(&flag, (const void *)target, 4) == 0 && flag == 1) { 
             regs->regs[19] = regs->regs[1]; 
             regs->pc += 4; 
             return; 
