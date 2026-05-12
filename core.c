@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.4 (Android 16 KMI Fix & PTE Lockless Walk & HBP Hotfix)
+ * Description:  Ghost Core Engine V27.6 (FPU-Safe ROP Gadget Injection Architecture)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
@@ -62,7 +62,7 @@ MODULE_LICENSE("GPL");
 
 static struct sock *wuwa_nl_sk = NULL;
 
-/* 严格对齐数据面结构，绝不删减 */
+/* 结构体扩展：新增 off_fov_gadget，严格维持 8 字节对齐 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -73,6 +73,7 @@ struct wuwa_hbp_req {
     uint64_t off_damage;
     uint64_t off_fov;
     uint64_t off_kill;
+    uint64_t off_fov_gadget; /* 新增：FOV ROP Gadget 跳转地址 */
     int      maxhp_on;
     uint64_t fov_val;      
     int      fov_reg;      
@@ -188,7 +189,6 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
     pmd = pmd_offset(pud, uaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
 
-    /* 架构重建：使用纯指针运算绕过 __pte_offset_map 符号未导出的限制 */
     pmd_phys = pmd_val(*pmd) & PTE_ADDR_MASK;
     pte = (pte_t *)phys_to_virt(pmd_phys) + ((uaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1));
 
@@ -223,20 +223,17 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
 
-    /* 修正全屏黑边移除：返回 0 (False) 欺骗渲染器关闭裁剪 */
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
         regs->regs[0] = 0; 
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return; 
     }
     
-    /* 秒过跳转控制流，专享 off_pause_jmp */
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
         regs->pc = base + g_cfg.off_pause_jmp; 
         return; 
     }
 
-    /* 修正致命的原子上下文崩溃，回滚为 fn_copy_nofault */
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         target = regs->regs[1] + 0x1C;
         if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
@@ -250,17 +247,23 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 全屏秒杀 (maxhp_on) */
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1;
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
         return;
     }
 
-    /* FOV 劫持控制流解耦：参数入 X0，通过 fov_val 注入 ROP Gadget */
+    /* 
+     * 核心重构：FPU 安全状态机注入
+     * 不在内核强碰 S0 寄存器，而是通过设置通用寄存器并跳转至用户态 Gadget 
+     */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
-        regs->regs[0] = 0x40900000; /* 4.5f (hex) */
-        regs->pc = base + g_cfg.fov_val; 
+        if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
+            /* 将 4.5f 的绝对地址注入目标通用寄存器 */
+            regs->regs[g_cfg.fov_reg] = base + g_cfg.fov_val; 
+        }
+        /* 控制流转交至 ldr s0, [...] 的指令地址 */
+        regs->pc = base + g_cfg.off_fov_gadget; 
         return; 
     }
 }
@@ -302,16 +305,12 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    /* 核心修复：补齐丢失的 秒杀 断点注册逻辑 */
     if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
 }
 
-/* ==========================================================
- * 清理逻辑：增加工作队列冲刷，消除残留竞争
- * ========================================================== */
 void wuwa_cleanup_perf_hbp(void) {
     int i;
 
@@ -587,7 +586,6 @@ static void inject_worker_handler(struct work_struct *w) {
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-                /* 核心修复：补齐线程注入时的 秒杀 断点装载逻辑 */
                 if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
@@ -610,9 +608,6 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     return 0;
 }
 
-/* ==========================================================
- * Netlink 幽灵通道：解包状态机
- * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
     struct wuwa_hbp_pkt *pkt;
