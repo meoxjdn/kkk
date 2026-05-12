@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V25 (Android 12~15 / Industrial Grade Architecture)
+ * Description:  Ghost Core Engine V26 (Netlink Zero-Node / Polymorphic Armor)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
- * Status:  Production Ready (Zero-Crash, Multi-Core Sync, PAC Stripped, Netlink 31)
+ * Status:  Production Ready (Atomic-Safe, PAC Stripped, YARA-Immune, Full Payload)
  * =====================================================================================
  */
 
@@ -42,7 +42,6 @@ MODULE_LICENSE("GPL");
 #define CMD_HBP_INSTALL  0x1001
 #define CMD_HBP_CLEANUP  0x1002
 
-/* PAC 指令签名剥离宏：兼容 Android 11+ 旗舰机型 */
 #ifndef ptrauth_strip_insn_pac
 #define ptrauth_strip_insn_pac(ptr) \
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
@@ -59,6 +58,8 @@ struct wuwa_hbp_req {
     uint64_t off_pause_jmp; 
     uint64_t off_damage;
     uint64_t off_fov;
+    uint64_t off_kill;
+    int      maxhp_on;
     uint64_t fov_val;      
     int      fov_reg;      
     int      fov_is_ptr;   
@@ -67,6 +68,12 @@ struct wuwa_hbp_req {
     int      border_on;
     int      skip_on;
     int      damage_on;
+};
+
+/* 动态多态加壳层 */
+struct wuwa_hbp_pkt {
+    uint32_t seed;
+    struct wuwa_hbp_req payload;
 };
 #pragma pack(pop)
 
@@ -127,6 +134,9 @@ static void cloak_module(void) {
     }
 }
 
+/* ==========================================================
+ * 硬件断点回调 (IRQ Atomic Safe & PAC Stripped)
+ * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
@@ -146,6 +156,13 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
         regs->pc = base + g_cfg.off_pause_jmp; 
         return; 
+    }
+    
+    /* 完整保留的秒杀断点逻辑 */
+    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
+        regs->regs[0] = 1;
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+        return;
     }
     
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
@@ -205,6 +222,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -235,6 +253,10 @@ void wuwa_cleanup_perf_hbp(void) {
 
     mutex_unlock(&g_bp_mutex);
 }
+
+/* ==========================================================
+ * VFS 全功能高仿真 perf_event 文件操作集
+ * ========================================================== */
 
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
@@ -369,6 +391,10 @@ static const struct file_operations ghost_perf_fops = {
     .mmap           = ghost_perf_mmap,
 };
 
+/* ==========================================================
+ * Kretprobe 劫持与参数阻断逻辑
+ * ========================================================== */
+
 static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
@@ -482,6 +508,7 @@ static void inject_worker_handler(struct work_struct *w) {
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
@@ -503,10 +530,15 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     return 0;
 }
 
+/* ==========================================================
+ * Netlink 幽灵通道：多态载荷动态解壳 (Polymorphic Decryption)
+ * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
-    struct wuwa_hbp_req *req;
+    struct wuwa_hbp_pkt *pkt;
+    struct wuwa_hbp_req plain;
     int len;
+    int i;
     
     if (!skb) return;
 
@@ -515,9 +547,15 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
 
     while (nlmsg_ok(nlh, len)) {
         if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
-            if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
-                req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
-                wuwa_install_perf_hbp(req);
+            if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_pkt)) {
+                pkt = (struct wuwa_hbp_pkt *)nlmsg_data(nlh);
+                
+                /* [核心改写] 在非 IRQ 的控制流上下文中完成异或解密，免疫静态扫描 */
+                for (i = 0; i < sizeof(plain); i++) {
+                    ((uint8_t*)&plain)[i] = ((uint8_t*)&pkt->payload)[i] ^ ((uint8_t*)&pkt->seed)[i % 4];
+                }
+                
+                wuwa_install_perf_hbp(&plain);
             }
         } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
             wuwa_cleanup_perf_hbp();
@@ -526,6 +564,9 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
     }
 }
 
+/* ==========================================================
+ * 模块初始化与 Kretprobe 注册
+ * ========================================================== */
 static struct kretprobe krp_perf = {
     .entry_handler = entry_handler_perf,
     .handler       = ret_handler_perf,
