@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V22 (Android 15 / Kretprobe + Netlink Zero-Node)
+ * Description:  Ghost Core Engine V22.1 (Android 15 / Kretprobe + Netlink Zero-Node)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Netlink Tunnel, VFS Routing)
+ * Status:  Production Ready (Zero-Crash, Thread-Safe Sync, Dynamic Probing)
  * =====================================================================================
  */
 
@@ -45,7 +45,6 @@ MODULE_LICENSE("GPL");
 
 static struct sock *wuwa_nl_sk = NULL;
 
-/* 结构体严格对齐，全量功能保留 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -133,6 +132,9 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (unlikely(!regs)) return;
     pc = regs->pc; base = g_game_base;
 
+    /* [战术探针] 动态输出命中情况，验证 CFG 拦截 */
+    pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx | Base: 0x%llx | Offset: 0x%llx\n", pc, base, pc - base);
+
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { regs->pc = base + g_cfg.off_pause_jmp; return; }
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
@@ -163,10 +165,11 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (!tsk) { put_pid(pid_struct); return -ESRCH; }
 
     mutex_lock(&g_bp_mutex);
-    if (g_bp_count == 0) {
-        g_target_tgid = tsk->tgid; g_game_base = req->base_addr;
-        memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
-    }
+    
+    /* [核心修复] 废除 g_bp_count == 0 限制，强制同步全局配置表，确保偏移纯净 */
+    g_target_tgid = tsk->tgid; 
+    g_game_base = req->base_addr;
+    memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     
     if (req->border_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
@@ -190,13 +193,14 @@ void wuwa_cleanup_perf_hbp(void) {
         } 
     }
     g_bp_count = 0; g_game_base = 0; g_target_tgid = 0;
+    /* 清理时同步擦除配置缓存 */
+    memset(&g_cfg, 0, sizeof(struct wuwa_hbp_req));
     mutex_unlock(&g_bp_mutex);
 }
 
 /* ==========================================================
  * VFS 全功能高仿真 perf_event 文件操作集
  * ========================================================== */
-
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
     uint64_t *p = (uint64_t *)((char *)buffer + sizeof(*header));
@@ -415,9 +419,8 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
 }
 
 /* ==========================================================
- * 子线程跟踪机制
+ * 子线程克隆异步拦截与自动补钩
  * ========================================================== */
-
 static void inject_worker_handler(struct work_struct *w) {
     struct inject_work *iw = container_of(w, struct inject_work, work);
     struct task_struct *tsk; struct pid *pid_struct = find_get_pid(iw->new_tid);
@@ -430,10 +433,7 @@ static void inject_worker_handler(struct work_struct *w) {
             if (g_cfg.skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { 
-                struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_kill); 
-                if (bp) g_bps[g_bp_count++] = bp; 
-            }
+            if (g_cfg.maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             mutex_unlock(&g_bp_mutex);
         }
         put_pid(pid_struct);
@@ -457,7 +457,6 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 /* ==========================================================
  * Netlink "零节点" 幽灵通信通道
  * ========================================================== */
-
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
     
@@ -478,7 +477,6 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
 /* ==========================================================
  * 模块初始化与钩子注册
  * ========================================================== */
-
 static struct kretprobe krp_perf = {
     .entry_handler = entry_handler_perf,
     .handler       = ret_handler_perf,
