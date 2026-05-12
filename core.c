@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V23 (Android 12~15 / Netlink Zero-Node / Kretprobe)
+ * Description:  Ghost Core Engine V23.1 (Android 12~15 / Netlink Zero-Node / Kretprobe)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Protocol 31 Anchored, Full Payload)
+ * Status:  Production Ready (ABI Truncation Fixed, Zero-Crash)
  * =====================================================================================
  */
 
@@ -38,10 +38,10 @@ MODULE_LICENSE("GPL");
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
-/* [核心架构变轨] 规避 Android 系统冲突，强制锚定高顺位协议号 31 */
+/* [底层架构修复] 适应 __u16 边界，防止 ABI 截断 */
 #define NETLINK_WUWA     31 
-#define CMD_HBP_INSTALL  0x5A5A1001
-#define CMD_HBP_CLEANUP  0x5A5A1002
+#define CMD_HBP_INSTALL  0x1001
+#define CMD_HBP_CLEANUP  0x1002
 
 static struct sock *wuwa_nl_sk = NULL;
 
@@ -224,9 +224,8 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * 高仿真 perf_event 文件操作集 (兼容双重欺骗)
+ * VFS 全功能高仿真 perf_event 文件操作集
  * ========================================================== */
-
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
     uint64_t *p = (uint64_t *)((char *)buffer + sizeof(*header));
@@ -361,7 +360,7 @@ static const struct file_operations ghost_perf_fops = {
 };
 
 /* ==========================================================
- * Kretprobe 劫持与参数阻断逻辑
+ * Kretprobe 劫持与参数熔断拦截网
  * ========================================================== */
 
 static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -501,7 +500,7 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 /* ==========================================================
- * Netlink "零节点" 幽灵通信通道 (标准状态机解析)
+ * Netlink "零节点" 幽灵通信通道
  * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
@@ -513,17 +512,12 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
     nlh = nlmsg_hdr(skb);
     len = skb->len;
 
-    /* [唤醒探针] 监控 Netlink 通信隧道的连通性 */
-    pr_info_ratelimited("[GhostCore] Netlink trigger! Type: 0x%x | Len: %u\n", nlh->nlmsg_type, nlh->nlmsg_len);
-
     while (nlmsg_ok(nlh, len)) {
         if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
             if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
                 req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
                 wuwa_install_perf_hbp(req);
                 pr_info("[GhostCore] ROP Payload injected via Netlink.\n");
-            } else {
-                pr_info("[GhostCore] Malformed payload dropped. Size: %u\n", nlmsg_len(nlh));
             }
         } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
             wuwa_cleanup_perf_hbp();
@@ -579,7 +573,7 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
-    /* 启动 Netlink 幽灵隧道，锚定协议号 31 */
+    /* 启动 Netlink 幽灵隧道 */
     wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
     if (!wuwa_nl_sk) {
         return -ENOMEM;
@@ -603,7 +597,6 @@ static int __init ghost_core_init(void) {
         register_kretprobe(&krp_clone);
     }
 
-    pr_info("[GhostCore] Netlink Zero-Node Engine Initialized on Family 31.\n");
     cloak_module();
     return 0;
 }
