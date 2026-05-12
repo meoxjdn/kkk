@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.1 (Netlink MemReader Hotfix & Polymorphic)
+ * Description:  Ghost Core Engine V27.2 (Android 16 KMI Fix & CFG Decoupled)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
@@ -48,6 +48,11 @@ MODULE_LICENSE("GPL");
 #ifndef ptrauth_strip_insn_pac
 #define ptrauth_strip_insn_pac(ptr) \
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
+#endif
+
+/* 兼容 Linux 6.12+ (Android 16 KMI) 废弃 PTE_ADDR_MASK 的改动 */
+#ifndef PTE_ADDR_MASK
+#define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
 #endif
 
 static struct sock *wuwa_nl_sk = NULL;
@@ -126,11 +131,9 @@ static struct user_hwdebug_state g_fake_break_ledger;
 static struct user_hwdebug_state g_fake_watch_ledger;
 static atomic_t fake_perf_count = ATOMIC_INIT(0);
 
-/* --- 核心修复：补全 Kretprobe 探针实例声明 --- */
 static struct kretprobe krp_perf;
 static struct kretprobe krp_ptrace;
 static struct kretprobe krp_clone;
-/* --------------------------------------------- */
 
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void (*unreg_fn_t)(struct perf_event *);
@@ -186,6 +189,7 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
         goto out_unlock;
     }
 
+    /* 应用跨 KMI 兼容的物理地址掩码 */
     pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
     kaddr = phys_to_virt(pa) + (uaddr & ~PAGE_MASK);
 
@@ -221,6 +225,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return; 
     }
     
+    /* 秒过跳转控制流，专享 off_pause_jmp */
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
         regs->pc = base + g_cfg.off_pause_jmp; 
         return; 
@@ -247,9 +252,10 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
+    /* FOV 劫持控制流解耦：参数入 X0，通过 fov_val 注入 ROP Gadget */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
-        regs->regs[0] = base + g_cfg.fov_val; 
-        regs->pc = base + g_cfg.off_pause_jmp; 
+        regs->regs[0] = 0x40900000; /* 4.5f (hex) */
+        regs->pc = base + g_cfg.fov_val; 
         return; 
     }
 }
@@ -303,7 +309,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 void wuwa_cleanup_perf_hbp(void) {
     int i;
 
-    /* 冲刷所有待处理的异步注入任务，斩断竞态链 */
     flush_workqueue(system_wq);
 
     mutex_lock(&g_bp_mutex);
@@ -599,7 +604,7 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 /* ==========================================================
- * Netlink 幽灵通道：修正后的内存穿透与解包状态机
+ * Netlink 幽灵通道：解包状态机
  * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
@@ -694,7 +699,6 @@ static int __init ghost_core_init(void) {
         return -ENOMEM;
     }
 
-    /* --- 核心修复：绑定 Handler、配置 Maxactive、防止内核溢出 --- */
     memset(&krp_perf, 0, sizeof(krp_perf));
     krp_perf.entry_handler = entry_handler_perf;
     krp_perf.handler = ret_handler_perf;
@@ -725,7 +729,6 @@ static int __init ghost_core_init(void) {
         krp_clone.kp.symbol_name = "sys_clone";
         register_kretprobe(&krp_clone);
     }
-    /* ----------------------------------------------------------- */
 
     cloak_module();
     return 0;
