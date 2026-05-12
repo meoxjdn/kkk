@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.3 (Android 16 KMI Fix & PTE Lockless Walk)
+ * Description:  Ghost Core Engine V27.4 (Android 16 KMI Fix & PTE Lockless Walk & HBP Hotfix)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
@@ -223,8 +223,9 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
 
+    /* 修正全屏黑边移除：返回 0 (False) 欺骗渲染器关闭裁剪 */
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
-        regs->regs[0] = 1; 
+        regs->regs[0] = 0; 
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return; 
     }
@@ -235,26 +236,26 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return; 
     }
 
-    /* 恢复被遗漏的 damage_on (伤害增幅) */
+    /* 修正致命的原子上下文崩溃，回滚为 fn_copy_nofault */
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    target = regs->regs[1] + 0x1C;
-    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-        regs->regs[19] = regs->regs[1]; 
-        regs->pc += 4; 
-        return; 
+        target = regs->regs[1] + 0x1C;
+        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
+            regs->regs[19] = regs->regs[1]; 
+            regs->pc += 4; 
+            return; 
+        }
+        regs->sp += 0x30; 
+        regs->regs[0] = 0; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+        return;
     }
-    regs->sp += 0x30; 
-    regs->regs[0] = 0; 
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-    return;
-}
 
-/* 全屏秒杀 (maxhp_on) */
-if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
-    regs->regs[0] = 1;
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
-    return;
-}
+    /* 全屏秒杀 (maxhp_on) */
+    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
+        regs->regs[0] = 1;
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+        return;
+    }
 
     /* FOV 劫持控制流解耦：参数入 X0，通过 fov_val 注入 ROP Gadget */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
@@ -301,6 +302,8 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+    /* 核心修复：补齐丢失的 秒杀 断点注册逻辑 */
+    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -584,6 +587,8 @@ static void inject_worker_handler(struct work_struct *w) {
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
+                /* 核心修复：补齐线程注入时的 秒杀 断点装载逻辑 */
+                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
