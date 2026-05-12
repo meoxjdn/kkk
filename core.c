@@ -249,6 +249,13 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     return;
 }
 
+/* 全屏秒杀 (maxhp_on) */
+if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
+    regs->regs[0] = 1;
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+    return;
+}
+
     /* FOV 劫持控制流解耦：参数入 X0，通过 fov_val 注入 ROP Gadget */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         regs->regs[0] = 0x40900000; /* 4.5f (hex) */
