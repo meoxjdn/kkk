@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V23 (Android 12~15 / Kretprobe + Netlink Zero-Node)
+ * Description:  Ghost Core Engine V23 (Android 12~15 / Netlink Zero-Node / Kretprobe)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Strict C90, Netlink Tunnel, Full Payload)
+ * Status:  Production Ready (Zero-Crash, Protocol 31 Anchored, Full Payload)
  * =====================================================================================
  */
 
@@ -38,8 +38,8 @@ MODULE_LICENSE("GPL");
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
-/* Netlink 通信魔术字与协议号对齐 */
-#define NETLINK_WUWA     2 /* NETLINK_USERSOCK */
+/* [核心架构变轨] 规避 Android 系统冲突，强制锚定高顺位协议号 31 */
+#define NETLINK_WUWA     31 
 #define CMD_HBP_INSTALL  0x5A5A1001
 #define CMD_HBP_CLEANUP  0x5A5A1002
 
@@ -137,8 +137,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc = regs->pc; 
     base = g_game_base;
 
-    /* 可选择注销探测日志，确保极致性能 */
-    /* pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx\n", pc); */
+    pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx | Base: 0x%llx | Offset: 0x%llx\n", pc, base, pc - base);
 
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { regs->pc = base + g_cfg.off_pause_jmp; return; }
@@ -173,6 +172,10 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     attr.disabled = 0;
     
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
+    
+    pr_info("[GhostCore] BP install attempt: addr=0x%llx tid=%d bp=%px IS_ERR=%ld\n",
+            addr, tsk->pid, bp, (long)PTR_ERR_OR_ZERO(bp));
+    
     return IS_ERR(bp) ? NULL : bp;
 }
 
@@ -221,7 +224,7 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ==========================================================
- * VFS 全功能高仿真 perf_event 文件操作集
+ * 高仿真 perf_event 文件操作集 (兼容双重欺骗)
  * ========================================================== */
 
 static void build_dynamic_sample(void *buffer, int seq) {
@@ -358,7 +361,7 @@ static const struct file_operations ghost_perf_fops = {
 };
 
 /* ==========================================================
- * Kretprobe 劫持与参数熔断拦截网
+ * Kretprobe 劫持与参数阻断逻辑
  * ========================================================== */
 
 static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -458,6 +461,9 @@ static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
+/* ==========================================================
+ * 子线程克隆异步拦截与补钩
+ * ========================================================== */
 static void inject_worker_handler(struct work_struct *w) {
     struct inject_work *iw = container_of(w, struct inject_work, work);
     struct task_struct *tsk; 
@@ -495,28 +501,40 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
 }
 
 /* ==========================================================
- * Netlink "零节点" 幽灵通信通道
+ * Netlink "零节点" 幽灵通信通道 (标准状态机解析)
  * ========================================================== */
 static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
     struct wuwa_hbp_req *req;
+    int len;
     
     if (!skb) return;
-    
-    nlh = (struct nlmsghdr *)skb->data;
-    
-    if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
-        if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
-            req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
-            wuwa_install_perf_hbp(req);
+
+    nlh = nlmsg_hdr(skb);
+    len = skb->len;
+
+    /* [唤醒探针] 监控 Netlink 通信隧道的连通性 */
+    pr_info_ratelimited("[GhostCore] Netlink trigger! Type: 0x%x | Len: %u\n", nlh->nlmsg_type, nlh->nlmsg_len);
+
+    while (nlmsg_ok(nlh, len)) {
+        if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
+            if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_req)) {
+                req = (struct wuwa_hbp_req *)nlmsg_data(nlh);
+                wuwa_install_perf_hbp(req);
+                pr_info("[GhostCore] ROP Payload injected via Netlink.\n");
+            } else {
+                pr_info("[GhostCore] Malformed payload dropped. Size: %u\n", nlmsg_len(nlh));
+            }
+        } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
+            wuwa_cleanup_perf_hbp();
+            pr_info("[GhostCore] Clean trigger executed via Netlink.\n");
         }
-    } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
-        wuwa_cleanup_perf_hbp();
+        nlh = nlmsg_next(nlh, &len);
     }
 }
 
 /* ==========================================================
- * 模块初始化与钩子注册
+ * 模块初始化与 Kretprobe 注册
  * ========================================================== */
 static struct kretprobe krp_perf = {
     .entry_handler = entry_handler_perf,
@@ -561,6 +579,7 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
+    /* 启动 Netlink 幽灵隧道，锚定协议号 31 */
     wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
     if (!wuwa_nl_sk) {
         return -ENOMEM;
@@ -584,6 +603,7 @@ static int __init ghost_core_init(void) {
         register_kretprobe(&krp_clone);
     }
 
+    pr_info("[GhostCore] Netlink Zero-Node Engine Initialized on Family 31.\n");
     cloak_module();
     return 0;
 }
