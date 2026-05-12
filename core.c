@@ -237,17 +237,17 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
     /* 恢复被遗漏的 damage_on (伤害增幅) */
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        target = regs->regs[1] + 0x1C;
-        if (probe_kernel_read(&flag, (const void *)target, 4) == 0 && flag == 1) { 
-            regs->regs[19] = regs->regs[1]; 
-            regs->pc += 4; 
-            return; 
-        }
-        regs->sp += 0x30; 
-        regs->regs[0] = 0; 
-        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-        return;
+    target = regs->regs[1] + 0x1C;
+    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
+        regs->regs[19] = regs->regs[1]; 
+        regs->pc += 4; 
+        return; 
     }
+    regs->sp += 0x30; 
+    regs->regs[0] = 0; 
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+    return;
+}
 
     /* FOV 劫持控制流解耦：参数入 X0，通过 fov_val 注入 ROP Gadget */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
