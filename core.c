@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V22.1 (Android 15 / Kretprobe + Netlink Zero-Node)
+ * Description:  Ghost Core Engine V22.2 (Android 15 / Kretprobe + Netlink Zero-Node)
  * Architecture:  AArch64 (ARMv8-A)
- * Status:  Production Ready (Zero-Crash, Thread-Safe Sync, Dynamic Probing)
+ * Status:  Diagnostic Ready (Dynamic HWBP Probing, Full Payload Retention)
  * =====================================================================================
  */
 
@@ -39,12 +39,13 @@ MODULE_LICENSE("GPL");
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
 /* Netlink 通信配置 */
-#define NETLINK_WUWA     NETLINK_USERSOCK
+#define NETLINK_WUWA     2 
 #define CMD_HBP_INSTALL  0x5A5A1001
 #define CMD_HBP_CLEANUP  0x5A5A1002
 
 static struct sock *wuwa_nl_sk = NULL;
 
+/* 结构体严格对齐，全量功能保留 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -132,7 +133,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (unlikely(!regs)) return;
     pc = regs->pc; base = g_game_base;
 
-    /* [战术探针] 动态输出命中情况，验证 CFG 拦截 */
     pr_info_ratelimited("[GhostCore] HWBP HIT! PC: 0x%llx | Base: 0x%llx | Offset: 0x%llx\n", pc, base, pc - base);
 
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { regs->regs[0] = 1; regs->pc = regs->regs[30]; return; }
@@ -150,10 +150,20 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { regs->regs[0] = base + g_cfg.fov_val; regs->pc = base + g_cfg.off_pause_jmp; return; }
 }
 
+/* [诊断注入点] 添加深度探测日志 */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
-    struct perf_event_attr attr; hw_breakpoint_init(&attr);
-    attr.bp_addr = addr; attr.bp_len = HW_BREAKPOINT_LEN_4; attr.bp_type = HW_BREAKPOINT_X; attr.disabled = 0;
+    struct perf_event_attr attr; 
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr; 
+    attr.bp_len = HW_BREAKPOINT_LEN_4; 
+    attr.bp_type = HW_BREAKPOINT_X; 
+    attr.disabled = 0;
+    
     struct perf_event *bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
+    
+    pr_info("[GhostCore] BP install attempt: addr=0x%llx tid=%d bp=%px IS_ERR=%ld\n",
+            addr, tsk->pid, bp, PTR_ERR_OR_ZERO(bp));
+    
     return IS_ERR(bp) ? NULL : bp;
 }
 
@@ -165,20 +175,19 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (!tsk) { put_pid(pid_struct); return -ESRCH; }
 
     mutex_lock(&g_bp_mutex);
+    if (g_bp_count == 0) {
+        g_target_tgid = tsk->tgid; 
+        g_game_base = req->base_addr;
+    }
     
-    /* [核心修复] 废除 g_bp_count == 0 限制，强制同步全局配置表，确保偏移纯净 */
-    g_target_tgid = tsk->tgid; 
-    g_game_base = req->base_addr;
+    /* 强同步状态机，确保偏移纯净 */
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     
     if (req->border_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { 
-        struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); 
-        if (bp) g_bps[g_bp_count++] = bp; 
-    }
+    if (req->maxhp_on  && g_bp_count < ARM64_MAX_HW_BPS) { struct perf_event *bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -193,7 +202,6 @@ void wuwa_cleanup_perf_hbp(void) {
         } 
     }
     g_bp_count = 0; g_game_base = 0; g_target_tgid = 0;
-    /* 清理时同步擦除配置缓存 */
     memset(&g_cfg, 0, sizeof(struct wuwa_hbp_req));
     mutex_unlock(&g_bp_mutex);
 }
@@ -201,6 +209,7 @@ void wuwa_cleanup_perf_hbp(void) {
 /* ==========================================================
  * VFS 全功能高仿真 perf_event 文件操作集
  * ========================================================== */
+
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
     uint64_t *p = (uint64_t *)((char *)buffer + sizeof(*header));
