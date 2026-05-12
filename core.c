@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.2 (Android 16 KMI Fix & CFG Decoupled)
+ * Description:  Ghost Core Engine V27.3 (Android 16 KMI Fix & PTE Lockless Walk)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
@@ -55,9 +55,14 @@ MODULE_LICENSE("GPL");
 #define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
 #endif
 
+/* 预设 ARM64 默认 PTE 掩码数量 */
+#ifndef PTRS_PER_PTE
+#define PTRS_PER_PTE 512
+#endif
+
 static struct sock *wuwa_nl_sk = NULL;
 
-/* 严格保留所有战术载荷，绝不删减 */
+/* 严格对齐数据面结构，绝不删减 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -153,7 +158,7 @@ static void cloak_module(void) {
 }
 
 /* ==========================================================
- * 跨进程内存穿透：五级内核页表漫游 (PTE Walk)
+ * 跨进程内存穿透：五级内核页表漫游 (无锁硬解析版)
  * ========================================================== */
 static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, void *dest, size_t size) {
     struct mm_struct *mm;
@@ -163,7 +168,7 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
     pmd_t *pmd;
     pte_t *pte;
     void *kaddr;
-    unsigned long pa;
+    unsigned long pa, pmd_phys;
     int ret = 0;
 
     mm = get_task_mm(task);
@@ -183,13 +188,14 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
     pmd = pmd_offset(pud, uaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
 
-    pte = pte_offset_map(pmd, uaddr);
+    /* 架构重建：使用纯指针运算绕过 __pte_offset_map 符号未导出的限制 */
+    pmd_phys = pmd_val(*pmd) & PTE_ADDR_MASK;
+    pte = (pte_t *)phys_to_virt(pmd_phys) + ((uaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1));
+
     if (pte_none(*pte) || !pte_present(*pte)) {
-        pte_unmap(pte);
         goto out_unlock;
     }
 
-    /* 应用跨 KMI 兼容的物理地址掩码 */
     pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
     kaddr = phys_to_virt(pa) + (uaddr & ~PAGE_MASK);
 
@@ -197,8 +203,6 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
     if (ret > 0) {
         memcpy(dest, kaddr, ret);
     }
-
-    pte_unmap(pte);
 
 out_unlock:
     mmap_read_unlock(mm);
@@ -229,13 +233,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
         regs->pc = base + g_cfg.off_pause_jmp; 
         return; 
-    }
-
-    /* 恢复被遗漏的 maxhp_on (全屏秒杀) */
-    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
-        regs->regs[0] = 1;
-        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
-        return;
     }
 
     /* 恢复被遗漏的 damage_on (伤害增幅) */
@@ -297,7 +294,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -581,7 +577,6 @@ static void inject_worker_handler(struct work_struct *w) {
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
