@@ -235,17 +235,17 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        target = regs->regs[1] + 0x1C;
-        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
-            regs->regs[19] = regs->regs[1]; 
-            regs->pc += 4; 
-            return; 
-        }
-        regs->sp += 0x30; 
-        regs->regs[0] = 0; 
-        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-        return;
+    target = regs->regs[1] + 0x1C;
+    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
+        regs->regs[19] = regs->regs[1]; 
+        regs->pc += 4; 
+        return; 
     }
+    regs->sp += 0x30; 
+    regs->regs[0] = 0; 
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+    return;
+}
 
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1;
