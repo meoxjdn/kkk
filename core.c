@@ -251,9 +251,10 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
      * 核心重构：绝对 PC 劫持流
      */
     if (g_cfg.custom_pc_on && pc == base + g_cfg.off_custom_trigger) {
-        regs->pc = 505612290ULL; /* 强制覆盖，将控制流重定向至指定十进制数值 */
-        return;
-    }
+    regs->regs[0] = 505612290;                              // 返回你想让函数返回的数值
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);     // 跳到调用者
+    return;
+}
 
     /* FPU 安全状态机注入 */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
