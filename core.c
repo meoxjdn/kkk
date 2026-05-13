@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.6 (FPU-Safe ROP Gadget Injection Architecture)
+ * Description:  Ghost Core Engine V27.7 (FPU-Safe ROP & Absolute PC Hijack)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
  * =====================================================================================
@@ -62,7 +62,7 @@ MODULE_LICENSE("GPL");
 
 static struct sock *wuwa_nl_sk = NULL;
 
-/* 结构体扩展：新增 off_fov_gadget，严格维持 8 字节对齐 */
+/* 结构体扩展：严格维持 8 字节对齐 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -72,9 +72,9 @@ struct wuwa_hbp_req {
     uint64_t off_pause_jmp; 
     uint64_t off_damage;
     uint64_t off_fov;
-    uint64_t off_kill;
-    uint64_t off_fov_gadget; /* 新增：FOV ROP Gadget 跳转地址 */
-    int      maxhp_on;
+    uint64_t off_custom_trigger; /* 自定义 PC 劫持触发地址 */
+    uint64_t off_fov_gadget; 
+    int      custom_pc_on;       /* 自定义 PC 劫持总开关 */
     uint64_t fov_val;      
     int      fov_reg;      
     int      fov_is_ptr;   
@@ -235,34 +235,31 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    target = regs->regs[1] + 0x1C;
-    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-        regs->regs[19] = regs->regs[1]; 
-        regs->pc += 4; 
-        return; 
-    }
-    regs->sp += 0x30; 
-    regs->regs[0] = 0; 
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-    return;
-}
-
-    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
-        regs->regs[0] = 1;
-        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+        target = regs->regs[1] + 0x1C;
+        if (fn_copy_nofault && fn_copy_nofault(&flag, (const void *)target, 4) == 0 && flag == 1) { 
+            regs->regs[19] = regs->regs[1]; 
+            regs->pc += 4; 
+            return; 
+        }
+        regs->sp += 0x30; 
+        regs->regs[0] = 0; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return;
     }
 
     /* 
-     * 核心重构：FPU 安全状态机注入
-     * 不在内核强碰 S0 寄存器，而是通过设置通用寄存器并跳转至用户态 Gadget 
+     * 核心重构：绝对 PC 劫持流
      */
+    if (g_cfg.custom_pc_on && pc == base + g_cfg.off_custom_trigger) {
+        regs->pc = 505612290ULL; /* 强制覆盖，将控制流重定向至指定十进制数值 */
+        return;
+    }
+
+    /* FPU 安全状态机注入 */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
-            /* 将 4.5f 的绝对地址注入目标通用寄存器 */
             regs->regs[g_cfg.fov_reg] = base + g_cfg.fov_val; 
         }
-        /* 控制流转交至 ldr s0, [...] 的指令地址 */
         regs->pc = base + g_cfg.off_fov_gadget; 
         return; 
     }
@@ -305,7 +302,9 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+    
+    /* 注册自定义 PC 劫持触发器断点 */
+    if (req->custom_pc_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_custom_trigger); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -586,7 +585,7 @@ static void inject_worker_handler(struct work_struct *w) {
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.custom_pc_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_custom_trigger); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
@@ -658,7 +657,6 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
                         task = pid_task(pid_struct, PIDTYPE_PID);
                         if (task) {
                             dest_buf = (void *)(reply_mreq + 1);
-                            /* 页表漫游穿透物理内存 */
                             bytes_read = ghost_read_task_mem(task, mreq->addr, dest_buf, mreq->size);
                             reply_mreq->size = bytes_read;
                         }
