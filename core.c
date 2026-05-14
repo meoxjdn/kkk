@@ -224,25 +224,29 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        /* 洗净指针高位，防止读取失败 */
-        uint64_t target = (regs->regs[1] & 0x00FFFFFFFFFFFFFFULL) + 0x1C;
+        if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
+        uint64_t target = regs->regs[1] + 0x1C;
         uint32_t flag = 0;
         
-        /* 换回原汁原味的 copy_from_user */
-        if (copy_from_user(&flag, (void __user *)target, 4) == 0) { 
-            /* 玩家受击，修改返回值为 1 并直接 RET */
-            if (flag == 256) {
-                regs->regs[0] = 1; 
-                regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-                return; 
-            }
+        /* * 【你原汁原味的逻辑】：
+         * 只有成功读到内存，且确信是怪物 (flag == 1) 时，才允许正常扣血！
+         */
+        if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
+            /* 怪物受击：放行，模拟原版新指令 SUB SP, SP, #0x40 */
+            regs->sp -= 0x40; 
+            regs->pc += 4; 
+            return; 
         }
         
-        /* 默认放行，执行原版最新指令 SUB SP, SP, #0x40 */
-        regs->sp -= 0x40; 
-        regs->pc += 4; 
+        /* * 【默认拦截分支】：
+         * 无论是读到玩家 (256)，还是因为中断限制读取失败，统统没收攻击！
+         * 按你的要求：MOV W0, #0x1 然后 RET
+         */
+        regs->regs[0] = 1; 
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return;
     }
+
 
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1;
