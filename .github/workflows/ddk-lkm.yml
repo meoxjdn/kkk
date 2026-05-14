@@ -23,7 +23,6 @@ jobs:
     name: Build ${{ inputs.module_name }} for ${{ inputs.kmi }}
     runs-on: ubuntu-latest
     container:
-      # 拉取指定版本的 Android GKI 编译环境
       image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
       options: --privileged
 
@@ -35,33 +34,29 @@ jobs:
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
         
-        # 【神级修复】：在编译期强行关闭 BTF 生成，从根源解决 Invalid name_offset，且不破坏 ELF 结构！
-        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n
+        # 【核心改动 1】：增加 PAHOLE=/bin/false 彻底从源头禁止生成 BTF 
+        # 因为 BTF 是由 pahole 工具生成的，直接把这个工具指向空，它就绝对生不出来！
+        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n PAHOLE=/bin/false modules
         
         mkdir -p /github/workspace/out
         
-        # 使用完整的 KMI 字符串作为标识，彻底杜绝矩阵并发时的命名覆写灾难
         FULL_KMI="${{ inputs.kmi }}"
         DEBUG_KO="${FULL_KMI}-debug.ko"
         RELEASE_KO="${FULL_KMI}-release.ko"
         
-        echo "=== Preserving Debug Symbols (For IDA Pro / Crash Analysis) ==="
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$DEBUG_KO"
-
-        echo "=== Stripping Symbols (For Stealth Deployment) ==="
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$RELEASE_KO"
         
-        # 鲁棒性加固：优先使用内核编译环境内置的 strip 工具链，保障底层 ELF 结构 ABI 绝对一致
+        # 【核心改动 2】：使用更彻底的剥离命令，强行剔除所有调试信息和 BTF 段
+        # 注意 --remove-section=.BTF 前面有一个点
         if [ -n "$STRIP" ] && command -v "$STRIP" &> /dev/null; then
-            $STRIP -d "/github/workspace/out/$RELEASE_KO"
+            $STRIP --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
         elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}strip" &> /dev/null; then
-            ${CROSS_COMPILE}strip -d "/github/workspace/out/$RELEASE_KO"
+            ${CROSS_COMPILE}strip --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
         else
-            # 降级退路
-            llvm-strip -d "/github/workspace/out/$RELEASE_KO"
+            llvm-strip --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
         fi
         
-        # 将唯一的产物包名称写入环境变量
         echo "ARTIFACT_NAME=$FULL_KMI-artifacts" >> $GITHUB_ENV
 
     - name: Upload Dual-Track Artifacts
