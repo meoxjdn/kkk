@@ -34,9 +34,8 @@ jobs:
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
         
-        # 【核心改动 1】：增加 PAHOLE=/bin/false 彻底从源头禁止生成 BTF 
-        # 因为 BTF 是由 pahole 工具生成的，直接把这个工具指向空，它就绝对生不出来！
-        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n PAHOLE=/bin/false modules
+        # 【神级修复】：去掉了末尾多余的 modules。在编译期强行关闭 BTF 生成，从源头解决 Invalid name_offset
+        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n PAHOLE=/bin/false
         
         mkdir -p /github/workspace/out
         
@@ -47,8 +46,7 @@ jobs:
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$DEBUG_KO"
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$RELEASE_KO"
         
-        # 【核心改动 2】：使用更彻底的剥离命令，强行剔除所有调试信息和 BTF 段
-        # 注意 --remove-section=.BTF 前面有一个点
+        # 强力剥离调试符号并物理切除残留的 .BTF 段
         if [ -n "$STRIP" ] && command -v "$STRIP" &> /dev/null; then
             $STRIP --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
         elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}strip" &> /dev/null; then
