@@ -3,7 +3,7 @@
  * Filename:  core.c
  * Description:  Ghost Core Engine V27.6 (FPU-Safe ROP Gadget Injection Architecture)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware)
- * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact)
+ * Status:  Production Ready (Page Walk Safe / Lock-Free / Full Payload Intact / Dynamic Netlink)
  * =====================================================================================
  */
 
@@ -39,7 +39,7 @@ MODULE_LICENSE("GPL");
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
-#define NETLINK_WUWA     31 
+/* 注意：移除了硬编码的 NETLINK_WUWA，改为动态池 */
 #define CMD_HBP_INSTALL  0x1001
 #define CMD_HBP_CLEANUP  0x1002
 #define CMD_MEM_READ     0x1003
@@ -291,11 +291,26 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     smp_mb(); 
     
-    if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->border_on && g_bp_count < MAX_BPS) { 
+        bp = install_bp(tsk, req->base_addr + req->off_border); 
+        if (bp) { g_bps[g_bp_count++] = bp; } 
+    }
+    if (req->skip_on   && g_bp_count < MAX_BPS) { 
+        bp = install_bp(tsk, req->base_addr + req->off_pause_win); 
+        if (bp) { g_bps[g_bp_count++] = bp; } 
+    }
+    if (req->damage_on && g_bp_count < MAX_BPS) { 
+        bp = install_bp(tsk, req->base_addr + req->off_damage); 
+        if (bp) { g_bps[g_bp_count++] = bp; } 
+    }
+    if (req->fov_on    && g_bp_count < MAX_BPS) { 
+        bp = install_bp(tsk, req->base_addr + req->off_fov); 
+        if (bp) { g_bps[g_bp_count++] = bp; } 
+    }
+    if (req->maxhp_on  && g_bp_count < MAX_BPS) { 
+        bp = install_bp(tsk, req->base_addr + req->off_kill); 
+        if (bp) { g_bps[g_bp_count++] = bp; } 
+    }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -674,6 +689,10 @@ static int init_ghost_resolver(void) {
 
 static int __init ghost_core_init(void) {
     struct netlink_kernel_cfg nl_cfg;
+    int ports[] = {31, 27, 26, 25}; // 备选端口池，优先尝试 31
+    int num_ports = 4;
+    int i;
+
     memset(&nl_cfg, 0, sizeof(nl_cfg));
     nl_cfg.input = ghost_nl_recv_msg;
 
@@ -686,7 +705,16 @@ static int __init ghost_core_init(void) {
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
-    wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
+    // ========================================================
+    // 动态扫描，寻找空闲 Netlink 端口进行驻留 (无痕静默模式)
+    // ========================================================
+    for (i = 0; i < num_ports; i++) {
+        wuwa_nl_sk = netlink_kernel_create(&init_net, ports[i], &nl_cfg);
+        if (wuwa_nl_sk) {
+            break;
+        }
+    }
+
     if (!wuwa_nl_sk) {
         return -ENOMEM;
     }
