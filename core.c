@@ -50,19 +50,16 @@ MODULE_LICENSE("GPL");
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
 #endif
 
-/* 兼容 Linux 6.12+ (Android 16 KMI) 废弃 PTE_ADDR_MASK 的改动 */
 #ifndef PTE_ADDR_MASK
 #define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
 #endif
 
-/* 预设 ARM64 默认 PTE 掩码数量 */
 #ifndef PTRS_PER_PTE
 #define PTRS_PER_PTE 512
 #endif
 
 static struct sock *wuwa_nl_sk = NULL;
 
-/* 结构体扩展：新增 off_fov_gadget，严格维持 8 字节对齐 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -73,7 +70,7 @@ struct wuwa_hbp_req {
     uint64_t off_damage;
     uint64_t off_fov;
     uint64_t off_kill;
-    uint64_t off_fov_gadget; /* 新增：FOV ROP Gadget 跳转地址 */
+    uint64_t off_fov_gadget; 
     int      maxhp_on;
     uint64_t fov_val;      
     int      fov_reg;      
@@ -158,9 +155,6 @@ static void cloak_module(void) {
     }
 }
 
-/* ==========================================================
- * 跨进程内存穿透：五级内核页表漫游 (无锁硬解析版)
- * ========================================================== */
 static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, void *dest, size_t size) {
     struct mm_struct *mm;
     pgd_t *pgd;
@@ -210,14 +204,9 @@ out_unlock:
     return ret;
 }
 
-/* ==========================================================
- * 硬件断点回调 (IRQ Atomic Safe & PAC Stripped & Full Payload)
- * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
-    uint32_t flag = 0;
-    uint64_t target;
     
     if (unlikely(!regs)) return;
     pc = regs->pc; 
@@ -234,24 +223,21 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return; 
     }
 
+    /* ---------------------------------------------------------
+     * 极简原版无敌逻辑 + SUB SP 适配
+     * --------------------------------------------------------- */
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        uint64_t target = regs->regs[1] + 0x1C;
-        uint32_t flag = 0;
+        uint64_t target_addr = regs->regs[1] + 0x1C;
+        uint32_t flag_val = 0;
         
-        /* * 【你原汁原味的逻辑】：
-         * 只有成功读到内存，且确信是怪物 (flag == 1) 时，才允许正常扣血！
-         */
-        if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-            /* 怪物受击：放行，模拟原版新指令 SUB SP, SP, #0x40 */
+        /* 怪物攻击（正常放行扣血）：读到 1，模拟 SUB SP, SP, #0x40 往下执行 */
+        if (copy_from_user(&flag_val, (void __user *)target_addr, 4) == 0 && flag_val == 1) { 
             regs->sp -= 0x40; 
             regs->pc += 4; 
             return; 
         }
         
-        /* * 【默认拦截分支】：
-         * 无论是读到玩家 (256)，还是因为中断限制读取失败，统统没收攻击！
-         * 按你的要求：MOV W0, #0x1 然后 RET
-         */
+        /* 玩家被攻击 或 读取失败（无敌拦截）：没收攻击，返回值为 1 */
         regs->regs[0] = 1; 
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return;
@@ -263,16 +249,10 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 
-     * 核心重构：FPU 安全状态机注入
-     * 不在内核强碰 S0 寄存器，而是通过设置通用寄存器并跳转至用户态 Gadget 
-     */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
-            /* 将 4.5f 的绝对地址注入目标通用寄存器 */
             regs->regs[g_cfg.fov_reg] = base + g_cfg.fov_val; 
         }
-        /* 控制流转交至 ldr s0, [...] 的指令地址 */
         regs->pc = base + g_cfg.off_fov_gadget; 
         return; 
     }
