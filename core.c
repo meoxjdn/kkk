@@ -216,8 +216,7 @@ out_unlock:
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
-    uint32_t flag = 0;
-    uint64_t target;
+    /* [修复点1] 删除了这里会导致 unused variable 编译报错的全局变量 flag 和 target */
     
     if (unlikely(!regs)) return;
     pc = regs->pc; 
@@ -235,30 +234,33 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    // 依然假设 X1 是攻击者，并且偏移 0x1C 是正确的
-    uint64_t target = regs->regs[1] + 0x1C; 
-    uint32_t flag = 0;
-    
-    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-        // 【玩家分支：正常攻击】
-        // 因为我们拦截了第一条指令，所以我们要手动模拟执行它
-        // 当前版本的原指令是 SUB SP, SP, #0x40
-        regs->sp -= 0x40;  // 手动分配栈空间
-        regs->pc += 4;     // 继续执行下一条指令
-        return; 
+        /* [修复点2] 变量仅在需要用到的局部块中声明 */
+        uint64_t target = regs->regs[1] + 0x1C; 
+        uint32_t flag = 0;
+        
+        if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
+            /* ==========================================
+             * 【玩家自己攻击：正常放行】
+             * 拦截在了首条指令 SUB SP, SP, #0x40。
+             * 为了让函数继续正常执行，我们需要手动模拟分配这 0x40 的栈空间。
+             * ========================================== */
+            regs->sp -= 0x40;  
+            regs->pc += 4;     /* PC 下移，跳过这句已经被我们模拟过的指令 */
+            return; 
+        }
+        
+        /* ==========================================
+         * 【怪物攻击：无情没收，实现玩家无敌】
+         * 由于我们拦截在了首条指令，此时原版代码的 SUB 还未执行，
+         * SP 仍然是上一层函数的原始干净状态！
+         * 因此，我们【绝对不能】做 SP += 操作，直接返回即可保持完美栈平衡。
+         * ========================================== */
+        regs->regs[0] = 0; /* 伪装返回值为 0，防止有些函数通过返回值判断 */
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); /* 直接跳转回调用者(LR) */
+        return;
     }
-    
-    // 【怪物分支：没收攻击，提前返回】
-    // 因为拦截在第一条指令，此时 SP 还没有被减去 0x40
-    // 所以我们【不需要】加回 SP，直接返回即可保持栈平衡！
-    regs->regs[0] = 0; // 伪造返回值为0（如果函数有返回值的话）
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); // 直接跳回上一层 LR
-    return;
-}
 
-
-    /* 
-     * 核心重构：FPU 安全状态机注入
+    /* * 核心重构：FPU 安全状态机注入
      * 不在内核强碰 S0 寄存器，而是通过设置通用寄存器并跳转至用户态 Gadget 
      */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
