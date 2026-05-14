@@ -34,11 +34,13 @@ jobs:
     - name: Compile Kernel Module
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
-        make KDIR=$KERNEL_SRC
+        
+        # 【神级修复】：在编译期强行关闭 BTF 生成，从根源解决 Invalid name_offset，且不破坏 ELF 结构！
+        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n
         
         mkdir -p /github/workspace/out
         
-        # 核心修复：使用完整的 KMI 字符串作为标识，彻底杜绝矩阵并发时的命名覆写灾难
+        # 使用完整的 KMI 字符串作为标识，彻底杜绝矩阵并发时的命名覆写灾难
         FULL_KMI="${{ inputs.kmi }}"
         DEBUG_KO="${FULL_KMI}-debug.ko"
         RELEASE_KO="${FULL_KMI}-release.ko"
@@ -57,19 +59,6 @@ jobs:
         else
             # 降级退路
             llvm-strip -d "/github/workspace/out/$RELEASE_KO"
-        fi
-        
-        # ===================================================================
-        # 【终极修复】：物理切除 .BTF 段，彻底解决 Invalid name_offset 报错
-        # ===================================================================
-        echo "=== Removing .BTF Section (Bypassing Android GKI Verification) ==="
-        if [ -n "$OBJCOPY" ] && command -v "$OBJCOPY" &> /dev/null; then
-            $OBJCOPY --remove-section .BTF "/github/workspace/out/$RELEASE_KO"
-        elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}objcopy" &> /dev/null; then
-            ${CROSS_COMPILE}objcopy --remove-section .BTF "/github/workspace/out/$RELEASE_KO"
-        else
-            # 降级退路
-            llvm-objcopy --remove-section .BTF "/github/workspace/out/$RELEASE_KO" || true
         fi
         
         # 将唯一的产物包名称写入环境变量
