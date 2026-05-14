@@ -235,23 +235,27 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    target = regs->regs[1] + 0x1C;
+    // 依然假设 X1 是攻击者，并且偏移 0x1C 是正确的
+    uint64_t target = regs->regs[1] + 0x1C; 
+    uint32_t flag = 0;
+    
     if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 1) { 
-        regs->regs[19] = regs->regs[1]; 
-        regs->pc += 4; 
+        // 【玩家分支：正常攻击】
+        // 因为我们拦截了第一条指令，所以我们要手动模拟执行它
+        // 当前版本的原指令是 SUB SP, SP, #0x40
+        regs->sp -= 0x40;  // 手动分配栈空间
+        regs->pc += 4;     // 继续执行下一条指令
         return; 
     }
-    regs->sp += 0x30; 
-    regs->regs[0] = 0; 
-    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+    
+    // 【怪物分支：没收攻击，提前返回】
+    // 因为拦截在第一条指令，此时 SP 还没有被减去 0x40
+    // 所以我们【不需要】加回 SP，直接返回即可保持栈平衡！
+    regs->regs[0] = 0; // 伪造返回值为0（如果函数有返回值的话）
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); // 直接跳回上一层 LR
     return;
 }
 
-    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
-        regs->regs[0] = 1;
-        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
-        return;
-    }
 
     /* 
      * 核心重构：FPU 安全状态机注入
