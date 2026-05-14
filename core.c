@@ -50,16 +50,19 @@ MODULE_LICENSE("GPL");
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
 #endif
 
+/* 兼容 Linux 6.12+ (Android 16 KMI) 废弃 PTE_ADDR_MASK 的改动 */
 #ifndef PTE_ADDR_MASK
 #define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
 #endif
 
+/* 预设 ARM64 默认 PTE 掩码数量 */
 #ifndef PTRS_PER_PTE
 #define PTRS_PER_PTE 512
 #endif
 
 static struct sock *wuwa_nl_sk = NULL;
 
+/* 结构体扩展：新增 off_fov_gadget，严格维持 8 字节对齐 */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int      tid;
@@ -70,7 +73,7 @@ struct wuwa_hbp_req {
     uint64_t off_damage;
     uint64_t off_fov;
     uint64_t off_kill;
-    uint64_t off_fov_gadget; 
+    uint64_t off_fov_gadget; /* 新增：FOV ROP Gadget 跳转地址 */
     int      maxhp_on;
     uint64_t fov_val;      
     int      fov_reg;      
@@ -145,23 +148,7 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 static reg_fn_t               fn_register   = NULL;
 static unreg_fn_t             fn_unregister = NULL;
 static kallsyms_lookup_name_t ghost_kallsyms = NULL;
-
-/* -------------------------------------------------------------
- * 核心升级：区分内核态读取与用户态安全读取
- * ------------------------------------------------------------- */
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
-static long (*fn_copy_user_nofault)(void *dst, const void __user *src, size_t size) = NULL;
-
-/* 万能用户态内存安全读取封装，完美兼容 Android 15 (Linux 6.6) */
-static int safe_read_user_mem(void *dst, const void __user *src, size_t size) {
-    if (fn_copy_user_nofault) {
-        return fn_copy_user_nofault(dst, src, size);
-    } else if (fn_copy_nofault) {
-        /* 旧版本内核兼容回退 */
-        return fn_copy_nofault(dst, (const void *)src, size);
-    }
-    return -EFAULT;
-}
 
 static void cloak_module(void) {
     struct module *mod = THIS_MODULE;
@@ -171,6 +158,9 @@ static void cloak_module(void) {
     }
 }
 
+/* ==========================================================
+ * 跨进程内存穿透：五级内核页表漫游 (无锁硬解析版)
+ * ========================================================== */
 static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, void *dest, size_t size) {
     struct mm_struct *mm;
     pgd_t *pgd;
@@ -189,10 +179,13 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
 
     pgd = pgd_offset(mm, uaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) goto out_unlock;
+
     p4d = p4d_offset(pgd, uaddr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) goto out_unlock;
+
     pud = pud_offset(p4d, uaddr);
     if (pud_none(*pud) || pud_bad(*pud)) goto out_unlock;
+
     pmd = pmd_offset(pud, uaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
 
@@ -217,12 +210,14 @@ out_unlock:
     return ret;
 }
 
+/* ==========================================================
+ * 硬件断点回调 (IRQ Atomic Safe & PAC Stripped & Full Payload)
+ * ========================================================== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
-    
-    __attribute__((unused)) uint32_t flag = 0;
-    __attribute__((unused)) uint64_t target;
+    uint32_t flag = 0;
+    uint64_t target;
     
     if (unlikely(!regs)) return;
     pc = regs->pc; 
@@ -240,44 +235,38 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        
-        /* * 【你找出的真理】：真实的实体对象在 X1 寄存器里！
-         */
-        uint64_t target = regs->regs[1] + 0x1C; 
-        uint32_t flag = 0;
-        
-        /* * 【进图防卡死铁闸】
-         * 进图 Loading 时大量对象未初始化，x1 经常是垃圾值或极小的数字。
-         * 必须限制只有合法的用户态内存地址，才允许去读取，避免内核死锁。
-         */
-        if (target > 0x10000000ULL && target < 0x00007FFFFFFFFFFFULL) {
-            
-            /* 安全读取内存 */
-            if (safe_read_user_mem(&flag, (void __user *)target, 4) == 0) { 
-                
-                /* 【判定为怪物 (256)】：没收攻击，玩家实现无敌！ */
-                if (flag == 256) {
-                    regs->regs[0] = 0; 
-                    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-                    return;
-                }
-            }
-        }
-        
-        /* * 【默认放行】：包含玩家自己(1)、进图加载时的乱码、合法性校验失败的
-         * 模拟最新版本的第一条汇编指令：SUB SP, SP, #0x40
-         */
-        regs->sp -= 0x40;  
-        regs->pc += 4;     
+    uint32_t flag = 0;
+    uint64_t attackInfo = regs->regs[1]; // X1 = attackInfo
+
+    // ★ 把判断从 flag == 1 改为 flag == 256
+    if (copy_from_user(&flag, (void __user *)(attackInfo + 0x1C), 4) == 0 && flag == 256) { 
+        // 己方攻击：放行
+        regs->pc += 4; 
         return; 
     }
+    // 敌方攻击：伤害归零
+    regs->sp += 0x40; // 新版本栈帧大小
+    regs->regs[0] = 0; 
+    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+    return;
+}
 
+    if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
+        regs->regs[0] = 1;
+        regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
+        return;
+    }
 
+    /* 
+     * 核心重构：FPU 安全状态机注入
+     * 不在内核强碰 S0 寄存器，而是通过设置通用寄存器并跳转至用户态 Gadget 
+     */
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
+            /* 将 4.5f 的绝对地址注入目标通用寄存器 */
             regs->regs[g_cfg.fov_reg] = base + g_cfg.fov_val; 
         }
+        /* 控制流转交至 ldr s0, [...] 的指令地址 */
         regs->pc = base + g_cfg.off_fov_gadget; 
         return; 
     }
@@ -494,8 +483,7 @@ static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *reg
     
     stash->is_fake_target = false;
     if (attr_uptr) {
-        /* 使用 safe_read_user_mem 修复原版的报错风险 */
-        if (safe_read_user_mem(&stash->attr, attr_uptr, sizeof(struct perf_event_attr)) == 0) {
+        if (fn_copy_nofault(&stash->attr, attr_uptr, sizeof(struct perf_event_attr)) == 0) {
             if (stash->attr.type == PERF_TYPE_BREAKPOINT) {
                 stash->is_fake_target = true;
                 regs->regs[0] = 0; 
@@ -559,8 +547,7 @@ static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *r
     else if (addr == 0x403) { stash->is_fake_target = true; stash->target_ledger = 2; }
 
     if (stash->is_fake_target) {
-        /* 使用 safe_read_user_mem 修复原版的报错风险 */
-        if (safe_read_user_mem(&stash->iov, stash->data, sizeof(struct iovec)) == 0) {
+        if (fn_copy_nofault(&stash->iov, stash->data, sizeof(struct iovec)) == 0) {
             regs->regs[3] = 0;
         } else {
             stash->is_fake_target = false; 
@@ -675,6 +662,7 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
                         task = pid_task(pid_struct, PIDTYPE_PID);
                         if (task) {
                             dest_buf = (void *)(reply_mreq + 1);
+                            /* 页表漫游穿透物理内存 */
                             bytes_read = ghost_read_task_mem(task, mreq->addr, dest_buf, mreq->size);
                             reply_mreq->size = bytes_read;
                         }
@@ -707,14 +695,9 @@ static int __init ghost_core_init(void) {
     
     fn_register   = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
     fn_unregister = (unreg_fn_t)ghost_kallsyms("unregister_hw_breakpoint");
-    
-    /* 核心修复：分别获取内核态和用户态的内存安全读取指针 */
     fn_copy_nofault = (void *)ghost_kallsyms("copy_from_kernel_nofault");
-    if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
-    
-    /* 专为 Linux 6.6 寻找用户态内存的安全读取函数 */
-    fn_copy_user_nofault = (void *)ghost_kallsyms("copy_from_user_nofault");
 
+    if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     if (!fn_register || !fn_unregister) return -ENOSYS;
 
     wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
