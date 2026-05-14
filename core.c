@@ -304,7 +304,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 void wuwa_cleanup_perf_hbp(void) {
     int i;
 
-    flush_workqueue(system_wq);
+    //flush_workqueue(system_wq);
 
     mutex_lock(&g_bp_mutex);
     
