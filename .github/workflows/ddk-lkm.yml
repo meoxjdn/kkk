@@ -38,7 +38,7 @@ jobs:
         
         mkdir -p /github/workspace/out
         
-        # 使用完整的 KMI 字符串作为标识
+        # 核心修复：使用完整的 KMI 字符串作为标识，彻底杜绝矩阵并发时的命名覆写灾难
         FULL_KMI="${{ inputs.kmi }}"
         DEBUG_KO="${FULL_KMI}-debug.ko"
         RELEASE_KO="${FULL_KMI}-release.ko"
@@ -49,7 +49,7 @@ jobs:
         echo "=== Stripping Symbols (For Stealth Deployment) ==="
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$RELEASE_KO"
         
-        # 优先使用内核编译环境内置的 strip 工具链
+        # 鲁棒性加固：优先使用内核编译环境内置的 strip 工具链，保障底层 ELF 结构 ABI 绝对一致
         if [ -n "$STRIP" ] && command -v "$STRIP" &> /dev/null; then
             $STRIP -d "/github/workspace/out/$RELEASE_KO"
         elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}strip" &> /dev/null; then
