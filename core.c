@@ -234,21 +234,27 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return; 
     }
 
-    /* * 你的原汁原味逻辑 + 256修改 + SUB SP, SP, #0x40 适配
-     */
-    if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        target = regs->regs[1] + 0x1C;
+        if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
+        uint64_t target = regs->regs[1] + 0x1C;
+        uint32_t flag = 0;
         
-        if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 256) { 
+        /* * 【关键修复】：用你源码自带的 fn_copy_nofault 替代 copy_from_user
+         * 这是在 Linux 6.6 中断里唯一能成功读到数据的正确姿势！
+         */
+        if (fn_copy_nofault(&flag, (void *)target, 4) == 0 && flag == 256) { 
+            
+            /* 玩家被攻击 (256)，按你的逻辑：MOV W0, #0x1 然后 RET */
             regs->regs[0] = 1; 
             regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
             return; 
         }
         
+        /* 怪物被攻击，或者读取失败时，默认放行，正常计算伤害 */
         regs->sp -= 0x40; 
         regs->pc += 4; 
         return;
     }
+
 
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1;
