@@ -239,21 +239,32 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         uint32_t flag = 0;
         
         /* * 【关键修复】：用你源码自带的 fn_copy_nofault 替代 copy_from_user
-         * 这是在 Linux 6.6 中断里唯一能成功读到数据的正确姿势！
-         */
-        if (fn_copy_nofault(&flag, (void *)target, 4) == 0 && flag == 256) { 
+            if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
+        
+        /* 1. 取 x1 寄存器，并清除可能存在的 ARM64 内存标签(TBI)高8位，防止读取失败 */
+        uint64_t target = (regs->regs[1] & 0x00FFFFFFFFFFFFFFULL) + 0x1C;
+        uint32_t flag = 0;
+        
+        /* 2. 换回你最初完美运行的 copy_from_user！ */
+        if (copy_from_user(&flag, (void __user *)target, 4) == 0) { 
             
-            /* 玩家被攻击 (256)，按你的逻辑：MOV W0, #0x1 然后 RET */
-            regs->regs[0] = 1; 
-            regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-            return; 
+            /* 3. 如果读到 256 (玩家被攻击) */
+            if (flag == 256) {
+                /* 按你说的改法：MOV W0, #0x1 然后 RET */
+                regs->regs[0] = 1; 
+                regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+                return; 
+            }
         }
         
-        /* 怪物被攻击，或者读取失败时，默认放行，正常计算伤害 */
+        /* 4. 怪物被攻击（或读取失败）：默认放行，正常计算伤害。
+         * 手动执行被覆盖的第一条新版汇编指令：SUB SP, SP, #0x40 
+         */
         regs->sp -= 0x40; 
         regs->pc += 4; 
         return;
     }
+
 
 
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
