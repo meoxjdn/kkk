@@ -235,17 +235,13 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-    uint32_t flag = 0;
-    uint64_t attackInfo = regs->regs[1]; // X1 = attackInfo
-
-    // ★ 把判断从 flag == 1 改为 flag == 256
-    if (copy_from_user(&flag, (void __user *)(attackInfo + 0x1C), 4) == 0 && flag == 256) { 
-        // 己方攻击：放行
+    target = regs->regs[1] + 0x1C;
+    if (copy_from_user(&flag, (void __user *)target, 4) == 0 && flag == 256) { 
+        regs->regs[19] = regs->regs[1]; 
         regs->pc += 4; 
         return; 
     }
-    // 敌方攻击：伤害归零
-    regs->sp += 0x40; // 新版本栈帧大小
+    regs->sp += 0x40; 
     regs->regs[0] = 0; 
     regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
     return;
