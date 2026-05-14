@@ -23,6 +23,7 @@ jobs:
     name: Build ${{ inputs.module_name }} for ${{ inputs.kmi }}
     runs-on: ubuntu-latest
     container:
+      # 拉取指定版本的 Android GKI 编译环境
       image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
       options: --privileged
 
@@ -33,28 +34,32 @@ jobs:
     - name: Compile Kernel Module
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
-        
-        # 【神级修复】：去掉了末尾多余的 modules。在编译期强行关闭 BTF 生成，从源头解决 Invalid name_offset
-        make KDIR=$KERNEL_SRC CONFIG_DEBUG_INFO_BTF=n PAHOLE=/bin/false
+        make KDIR=$KERNEL_SRC
         
         mkdir -p /github/workspace/out
         
+        # 使用完整的 KMI 字符串作为标识
         FULL_KMI="${{ inputs.kmi }}"
         DEBUG_KO="${FULL_KMI}-debug.ko"
         RELEASE_KO="${FULL_KMI}-release.ko"
         
+        echo "=== Preserving Debug Symbols (For IDA Pro / Crash Analysis) ==="
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$DEBUG_KO"
+
+        echo "=== Stripping Symbols (For Stealth Deployment) ==="
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$RELEASE_KO"
         
-        # 强力剥离调试符号并物理切除残留的 .BTF 段
+        # 优先使用内核编译环境内置的 strip 工具链
         if [ -n "$STRIP" ] && command -v "$STRIP" &> /dev/null; then
-            $STRIP --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
+            $STRIP -d "/github/workspace/out/$RELEASE_KO"
         elif [ -n "$CROSS_COMPILE" ] && command -v "${CROSS_COMPILE}strip" &> /dev/null; then
-            ${CROSS_COMPILE}strip --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
+            ${CROSS_COMPILE}strip -d "/github/workspace/out/$RELEASE_KO"
         else
-            llvm-strip --strip-debug --remove-section=.BTF "/github/workspace/out/$RELEASE_KO"
+            # 降级退路
+            llvm-strip -d "/github/workspace/out/$RELEASE_KO"
         fi
         
+        # 将唯一的产物包名称写入环境变量
         echo "ARTIFACT_NAME=$FULL_KMI-artifacts" >> $GITHUB_ENV
 
     - name: Upload Dual-Track Artifacts
