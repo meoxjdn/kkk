@@ -238,7 +238,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         uint64_t target = regs->regs[1] + 0x1C;
         uint32_t flag = 0;
         
-        /* * 【关键修复】：用你源码自带的 fn_copy_nofault 替代 copy_from_user
             if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         
         /* 1. 取 x1 寄存器，并清除可能存在的 ARM64 内存标签(TBI)高8位，防止读取失败 */
@@ -264,6 +263,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         regs->pc += 4; 
         return;
     }
+
 
 
 
