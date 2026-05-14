@@ -240,24 +240,39 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
-        target = regs->regs[1] + 0x1C; 
+        if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         
-        /* 终于！用专用的用户态读取函数，突破 Linux 6.6 的严苛安检 */
-        if (safe_read_user_mem(&flag, (void __user *)target, 4) == 0) { 
+        /* * 【你找出的真理】：真实的实体对象在 X1 寄存器里！
+         */
+        uint64_t target = regs->regs[1] + 0x1C; 
+        uint32_t flag = 0;
+        
+        /* * 【进图防卡死铁闸】
+         * 进图 Loading 时大量对象未初始化，x1 经常是垃圾值或极小的数字。
+         * 必须限制只有合法的用户态内存地址，才允许去读取，避免内核死锁。
+         */
+        if (target > 0x10000000ULL && target < 0x00007FFFFFFFFFFFULL) {
             
-            /* 如果是怪物发起攻击（256），没收它的攻击，跳出函数！ */
-            if (flag == 256) {
-                regs->regs[0] = 0; 
-                regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
-                return;
+            /* 安全读取内存 */
+            if (safe_read_user_mem(&flag, (void __user *)target, 4) == 0) { 
+                
+                /* 【判定为怪物 (256)】：没收攻击，玩家实现无敌！ */
+                if (flag == 256) {
+                    regs->regs[0] = 0; 
+                    regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
+                    return;
+                }
             }
         }
         
-        /* 玩家发起攻击(1) 或是读取失败时的默认放行策略 */
+        /* * 【默认放行】：包含玩家自己(1)、进图加载时的乱码、合法性校验失败的
+         * 模拟最新版本的第一条汇编指令：SUB SP, SP, #0x40
+         */
         regs->sp -= 0x40;  
         regs->pc += 4;     
         return; 
     }
+
 
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
