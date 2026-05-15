@@ -2,7 +2,7 @@
  * =====================================================================================
  * Filename:  core.c
  * Description:  Ghost Core Engine V27.6 (FPU-Safe ROP Gadget Injection Architecture)
- * Architecture:  AArch64 (ARMv8-A + PAC Aware + CFI Immune)
+ * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Dynamic Netlink / Panic-Free)
  * =====================================================================================
  */
@@ -36,7 +36,7 @@
 
 MODULE_LICENSE("GPL");
 
-/* ===== 核心防御：强行要求 Clang 放弃对特定函数进行 CFI 校验，防止跳板劫持被处决 ===== */
+/* ===== 核心防御：强行要求 Clang 放弃对特定函数进行 CFI 校验，防止跳板与指针调用被处决 ===== */
 #ifndef __nocfi
 #define __nocfi __attribute__((no_sanitize("cfi")))
 #endif
@@ -212,7 +212,6 @@ out_unlock:
     return ret;
 }
 
-/* 免疫 CFI：硬件断点回调触发频繁，极易被判定为控制流劫持，必须摘除验证 */
 __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
@@ -262,7 +261,7 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     }
 }
 
-static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
+__nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr; 
     struct perf_event *bp;
     
@@ -276,7 +275,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     return IS_ERR(bp) ? NULL : bp;
 }
 
-int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
+__nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct task_struct *tsk; 
     struct pid *pid_struct;
     struct perf_event *bp;
@@ -320,7 +319,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     put_pid(pid_struct); return 0;
 }
 
-void wuwa_cleanup_perf_hbp(void) {
+__nocfi void wuwa_cleanup_perf_hbp(void) {
     int i;
 
     mutex_lock(&g_bp_mutex);
@@ -480,7 +479,6 @@ static const struct file_operations ghost_perf_fops = {
     .mmap           = ghost_perf_mmap,
 };
 
-/* 免疫 CFI：Kretprobe 回调使用跳板机制劫持返回地址，极其容易触发 CFI Panic */
 __nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
