@@ -2,7 +2,7 @@
  * =====================================================================================
  * Filename:  core.c
  * Description:  Ghost Core Engine V27.6 (FPU-Safe ROP Gadget Injection Architecture)
- * Architecture:  AArch64 (ARMv8-A + PAC Aware)
+ * Architecture:  AArch64 (ARMv8-A + PAC Aware + CFI Immune)
  * Status:  Production Ready (Page Walk Safe / Lock-Free / Dynamic Netlink / Panic-Free)
  * =====================================================================================
  */
@@ -26,7 +26,7 @@
 #include <linux/poll.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
-#include <linux/highmem.h>   // 【修复Bug 2】引入高端内存映射头文件
+#include <linux/highmem.h>
 #include <linux/netlink.h>
 #include <net/sock.h>
 #include <net/net_namespace.h>
@@ -36,7 +36,12 @@
 
 MODULE_LICENSE("GPL");
 
-#define MAX_BPS          512 // 【容量升级】从 160 扩容至 512，防止多线程游戏掉线
+/* ===== 核心防御：强行要求 Clang 放弃对特定函数进行 CFI 校验，防止跳板劫持被处决 ===== */
+#ifndef __nocfi
+#define __nocfi __attribute__((no_sanitize("cfi")))
+#endif
+
+#define MAX_BPS          512 
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
@@ -191,7 +196,6 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
         goto out_unlock;
     }
 
-    /* 【修复Bug 2：使用 kmap_atomic 替代危险的 phys_to_virt，彻底根除 Bad Page State 死机】 */
     pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
     ret = min_t(size_t, size, PAGE_SIZE - (uaddr & ~PAGE_MASK));
     
@@ -208,7 +212,8 @@ out_unlock:
     return ret;
 }
 
-static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
+/* 免疫 CFI：硬件断点回调触发频繁，极易被判定为控制流劫持，必须摘除验证 */
+__nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
     
@@ -231,7 +236,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         uint64_t target_addr = regs->regs[1] + 0x1C;
         uint32_t flag_val = 0;
         
-        /* 【修复Bug 1：禁止在中断中使用 copy_from_user，改用安全探针 fn_copy_nofault，免疫内核崩溃及反作弊内存陷阱】 */
         if (fn_copy_nofault && fn_copy_nofault(&flag_val, (void *)target_addr, 4) == 0 && flag_val == 1) { 
             regs->sp -= 0x40; 
             regs->pc += 4; 
@@ -476,7 +480,8 @@ static const struct file_operations ghost_perf_fops = {
     .mmap           = ghost_perf_mmap,
 };
 
-static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
+/* 免疫 CFI：Kretprobe 回调使用跳板机制劫持返回地址，极其容易触发 CFI Panic */
+__nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
     
@@ -492,7 +497,7 @@ static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *reg
     return 0;
 }
 
-static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
+__nocfi static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     long ret = regs_return_value(regs);
     
@@ -534,7 +539,7 @@ static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs)
     return 0;
 }
 
-static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
+__nocfi static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
     long addr = regs->regs[2];
     
@@ -555,7 +560,7 @@ static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *r
     return 0;
 }
 
-static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
+__nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
     long ret = regs_return_value(regs);
     
@@ -598,7 +603,7 @@ static void inject_worker_handler(struct work_struct *w) {
     kfree(iw);
 }
 
-static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+__nocfi static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
     long ret_tid = regs_return_value(regs);
     if (ret_tid > 0 && g_target_tgid != 0 && current->tgid == g_target_tgid) {
         struct inject_work *iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
@@ -611,7 +616,7 @@ static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs
     return 0;
 }
 
-static void ghost_nl_recv_msg(struct sk_buff *skb) {
+__nocfi static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh;
     struct wuwa_hbp_pkt *pkt;
     struct wuwa_hbp_req plain;
@@ -661,7 +666,6 @@ static void ghost_nl_recv_msg(struct sk_buff *skb) {
                         task = pid_task(pid_struct, PIDTYPE_PID);
                         if (task) {
                             dest_buf = (void *)(reply_mreq + 1);
-                            /* 页表漫游穿透物理内存 */
                             bytes_read = ghost_read_task_mem(task, mreq->addr, dest_buf, mreq->size);
                             reply_mreq->size = bytes_read;
                         }
@@ -699,7 +703,6 @@ static int __init ghost_core_init(void) {
     fn_register   = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
     fn_unregister = (unreg_fn_t)ghost_kallsyms("unregister_hw_breakpoint");
     
-    /* 【修复Bug 3：调整解析顺序，优先读取 user_nofault，无视高版本内核 PAN 防护，完美生效伪装数据】 */
     fn_copy_nofault = (void *)ghost_kallsyms("copy_from_user_nofault");
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("copy_from_kernel_nofault");
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
