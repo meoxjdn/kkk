@@ -37,7 +37,7 @@
 
 MODULE_LICENSE("GPL");
 
-/* ===== 核心劫持配置 ===== */
+/* ===== 自动化劫持配置 ===== */
 #define TARGET_LIB_NAME    "libtersafe.so"
 #define HIJACK_OFFSET      0x558A50
 
@@ -135,7 +135,7 @@ struct inject_work {
 
 static int               g_target_tgid = 0;
 static uint64_t          g_game_base   = 0;
-static uint64_t          g_lib_base    = 0; /* libtersafe.so 的动态基址 */
+static uint64_t          g_lib_base    = 0; /* 动态捕获的 libtersafe.so 基址 */
 static struct perf_event *g_bps[MAX_BPS];
 static int               g_bp_count    = 0;
 static struct wuwa_hbp_req g_cfg;
@@ -159,16 +159,18 @@ static kallsyms_lookup_name_t ghost_kallsyms = NULL;
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
 
 /* -------------------------------------------------------------------------
- * 辅助：遍历进程 VMA 获取 libtersafe.so 基址
+ * 辅助逻辑：内核态遍历 VMA 获取库基址 (适配 ASLR)
  * ------------------------------------------------------------------------- */
-static uint64_t get_lib_base_address(struct task_struct *task, const char *lib_name) {
+static uint64_t find_lib_base_kernel(struct task_struct *task, const char *lib_name) {
     struct mm_struct *mm = get_task_mm(task);
     struct vm_area_struct *vma;
     uint64_t addr = 0;
+
     if (!mm) return 0;
     mmap_read_lock(mm);
-    VMA_ITERATOR(vmi, mm, 0);
-    for_each_vma(vmi, vma) {
+    
+    /* 现代内核推荐使用 vma_iterator 或直接遍历 mmap 链表 */
+    for (vma = mm->mmap; vma; vma = vma->vm_next) {
         if (vma->vm_file && vma->vm_file->f_path.dentry) {
             if (strstr(vma->vm_file->f_path.dentry->d_name.name, lib_name)) {
                 addr = (uint64_t)vma->vm_start;
@@ -176,6 +178,7 @@ static uint64_t get_lib_base_address(struct task_struct *task, const char *lib_n
             }
         }
     }
+    
     mmap_read_unlock(mm);
     mmput(mm);
     return addr;
@@ -208,17 +211,22 @@ static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr, vo
 
     pgd = pgd_offset(mm, uaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) goto out_unlock;
+
     p4d = p4d_offset(pgd, uaddr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) goto out_unlock;
+
     pud = pud_offset(p4d, uaddr);
     if (pud_none(*pud) || pud_bad(*pud)) goto out_unlock;
+
     pmd = pmd_offset(pud, uaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
 
     pmd_phys = pmd_val(*pmd) & PTE_ADDR_MASK;
     pte = (pte_t *)phys_to_virt(pmd_phys) + ((uaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1));
 
-    if (pte_none(*pte) || !pte_present(*pte)) goto out_unlock;
+    if (pte_none(*pte) || !pte_present(*pte)) {
+        goto out_unlock;
+    }
 
     pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
     ret = min_t(size_t, size, PAGE_SIZE - (uaddr & ~PAGE_MASK));
@@ -236,18 +244,22 @@ out_unlock:
     return ret;
 }
 
+/* -------------------------------------------------------------------------
+ * 劫持核心处理器 (HBP Handler)
+ * ------------------------------------------------------------------------- */
 __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc; 
     uint64_t base;
-    uint64_t lib_base;
+    uint64_t l_base;
     
     if (unlikely(!regs)) return;
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
-    lib_base = READ_ONCE(g_lib_base);
+    l_base = READ_ONCE(g_lib_base);
 
-    /* 劫持 libtersafe.so @ 0x558A50，强制劫持 PC 到 LR (模拟 ret) */
-    if (lib_base && pc == lib_base + HIJACK_OFFSET) {
+    /* 劫持点：libtersafe.so 目标偏移执行前拦截 */
+    if (l_base != 0 && pc == l_base + HIJACK_OFFSET) {
+        /* 控制流重定向：PC = LR (模拟 ret) */
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
         return;
     }
@@ -321,12 +333,12 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (g_bp_count == 0) {
         g_target_tgid = tsk->tgid; 
         WRITE_ONCE(g_game_base, req->base_addr);
-        
-        /* 动态查找 libtersafe 基址并尝试安装断点 */
-        uint64_t lbase = get_lib_base_address(tsk, TARGET_LIB_NAME);
-        if (lbase) {
-            WRITE_ONCE(g_lib_base, lbase);
-            bp = install_bp(tsk, lbase + HIJACK_OFFSET);
+
+        /* 自动化补丁：捕获 libtersafe.so 基址并下断 */
+        uint64_t l_base = find_lib_base_kernel(tsk, TARGET_LIB_NAME);
+        if (l_base != 0) {
+            WRITE_ONCE(g_lib_base, l_base);
+            bp = install_bp(tsk, l_base + HIJACK_OFFSET);
             if (bp) g_bps[g_bp_count++] = bp;
         }
     }
@@ -363,7 +375,9 @@ __nocfi void wuwa_cleanup_perf_hbp(void) {
     int i;
     mutex_lock(&g_bp_mutex);
     for (i = 0; i < g_bp_count; i++) {
-        if (g_bps[i]) perf_event_disable(g_bps[i]); 
+        if (g_bps[i]) {
+            perf_event_disable(g_bps[i]); 
+        }
     }
     for (i = 0; i < g_bp_count; i++) { 
         if (g_bps[i]) { 
@@ -380,6 +394,9 @@ __nocfi void wuwa_cleanup_perf_hbp(void) {
     mutex_unlock(&g_bp_mutex);
 }
 
+/* -------------------------------------------------------------------------
+ * 伪造事件填充 logic
+ * ------------------------------------------------------------------------- */
 static void build_dynamic_sample(void *buffer, int seq) {
     struct perf_event_header *header = buffer;
     uint64_t *p = (uint64_t *)((char *)buffer + sizeof(*header));
@@ -423,6 +440,9 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * Anon Inode 模拟系统
+ * ------------------------------------------------------------------------- */
 static int ghost_perf_release(struct inode *inode, struct file *file) {
     struct fake_perf_event *fake = file->private_data;
     if (fake) {
@@ -443,7 +463,7 @@ static ssize_t ghost_perf_read(struct file *file, char __user *buf, size_t count
     seq = atomic_inc_return(&fake->event_seq);
     build_dynamic_sample(sample_buf, seq);
     h = (struct perf_event_header *)sample_buf;
-    cp_size = min_t(size_t, count, (size_t)h->size);
+    cp_size = min_t(size_t, count, h->size);
     if (copy_to_user(buf, sample_buf, cp_size)) return -EFAULT;
     return cp_size;
 }
@@ -476,16 +496,27 @@ static int ghost_perf_mmap(struct file *file, struct vm_area_struct *vma) {
 }
 
 static const struct file_operations ghost_perf_fops = {
-    .owner = THIS_MODULE, .release = ghost_perf_release, .unlocked_ioctl = ghost_perf_ioctl,
-    .compat_ioctl = ghost_perf_ioctl, .read = ghost_perf_read, .poll = ghost_perf_poll, .mmap = ghost_perf_mmap,
+    .owner          = THIS_MODULE,
+    .release        = ghost_perf_release,
+    .unlocked_ioctl = ghost_perf_ioctl,
+    .compat_ioctl   = ghost_perf_ioctl,
+    .read           = ghost_perf_read,
+    .poll           = ghost_perf_poll,
+    .mmap           = ghost_perf_mmap,
 };
 
+/* -------------------------------------------------------------------------
+ * 系统劫持 (kretprobes)
+ * ------------------------------------------------------------------------- */
 __nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
     stash->is_fake_target = false;
     if (attr_uptr && fn_copy_nofault && fn_copy_nofault(&stash->attr, attr_uptr, sizeof(struct perf_event_attr)) == 0) {
-        if (stash->attr.type == PERF_TYPE_BREAKPOINT) { stash->is_fake_target = true; regs->regs[0] = 0; }
+        if (stash->attr.type == PERF_TYPE_BREAKPOINT) {
+            stash->is_fake_target = true;
+            regs->regs[0] = 0; 
+        }
     }
     return 0;
 }
@@ -545,12 +576,12 @@ static void inject_worker_handler(struct work_struct *w) {
         if (tsk) {
             mutex_lock(&g_bp_mutex);
             if (g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
-                /* 对新线程同步 libtersafe 劫持断点 */
-                if (g_lib_base) {
+                /* 对新线程注入 libtersafe 断点 */
+                if (g_lib_base != 0) {
                     bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET);
                     if (bp) g_bps[g_bp_count++] = bp;
                 }
-                /* 同步原有功能断点 */
+                /* 注入其余业务断点 */
                 if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
@@ -573,6 +604,9 @@ __nocfi static int clone_ret_handler(struct kretprobe_instance *ri, struct pt_re
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Netlink 通讯层
+ * ------------------------------------------------------------------------- */
 __nocfi static void ghost_nl_recv_msg(struct sk_buff *skb) {
     struct nlmsghdr *nlh; struct wuwa_hbp_pkt *pkt; struct wuwa_hbp_req plain; int len, i;
     if (!skb) return;
@@ -581,7 +615,8 @@ __nocfi static void ghost_nl_recv_msg(struct sk_buff *skb) {
         if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
             if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_pkt)) {
                 pkt = (struct wuwa_hbp_pkt *)nlmsg_data(nlh);
-                for (i = 0; i < sizeof(plain); i++) ((uint8_t*)&plain)[i] = ((uint8_t*)&pkt->payload)[i] ^ ((uint8_t*)&pkt->seed)[i % 4];
+                for (i = 0; i < sizeof(plain); i++)
+                    ((uint8_t*)&plain)[i] = ((uint8_t*)&pkt->payload)[i] ^ ((uint8_t*)&pkt->seed)[i % 4];
                 wuwa_install_perf_hbp(&plain);
             }
         } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) wuwa_cleanup_perf_hbp();
@@ -609,6 +644,9 @@ __nocfi static void ghost_nl_recv_msg(struct sk_buff *skb) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * 初始化模块
+ * ------------------------------------------------------------------------- */
 static int init_ghost_resolver(void) {
     struct kprobe kp; memset(&kp, 0, sizeof(kp)); kp.symbol_name = "kallsyms_lookup_name";
     if (register_kprobe(&kp) < 0) return -1;
