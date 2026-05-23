@@ -1,9 +1,9 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.7 (Android 15 / Kernel 6.6 Optimized)
+ * Description:  Ghost Core Engine V27.7.1 (Android 15 / Kernel 6.6 Optimized)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
- * Status:  Production Ready (Strict Bounds Fix / NMI Safe / No Kernel Panic)
+ * Status:  Production Ready (Strict Bounds Fix / NMI Safe / Forward Declaration Fixed)
  * Integration:  Control Flow Hijacking for libtersafe.so + Auto Kill67
  * =====================================================================================
  */
@@ -38,7 +38,7 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("GhostExpert");
-MODULE_DESCRIPTION("V27.7 AArch64 HBP Hijacker with Anti-Deadlock Framework");
+MODULE_DESCRIPTION("V27.7.1 AArch64 HBP Hijacker with Anti-Deadlock Framework");
 
 /* ===== 核心配置 ===== */
 #define TARGET_LIB_NAME    "libtersafe.so"
@@ -48,7 +48,7 @@ MODULE_DESCRIPTION("V27.7 AArch64 HBP Hijacker with Anti-Deadlock Framework");
 #define __nocfi __attribute__((no_sanitize("cfi")))
 #endif
 
-/* [修复点] 提升最大断点容量，适应多线程引擎疯狂创建的短生命周期线程 */
+/* 提升最大断点容量，适应多线程引擎疯狂创建的短生命周期线程 */
 #define MAX_BPS          2048 
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
@@ -169,7 +169,13 @@ static unreg_fn_t             fn_unregister = NULL;
 static kallsyms_lookup_name_t ghost_kallsyms = NULL;
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
 
-/* [修复点] 安全断点注入宏，根绝 g_bps 越界写入引发的 Kernel Panic */
+/* =========================================================================
+ * [核心修复] 前向声明 (Forward Declaration)
+ * 提前声明异常处理器的签名，打通编译器的单遍扫描与符号解析过程。
+ * ========================================================================= */
+__nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs);
+
+/* 安全断点注入宏，根绝 g_bps 越界写入引发的 Kernel Panic */
 #define SAFE_INSTALL_BP(tsk, addr) \
     do { \
         if (g_bp_count < MAX_BPS) { \
@@ -264,6 +270,7 @@ __nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t a
     attr.bp_len = HW_BREAKPOINT_LEN_4; 
     attr.bp_type = HW_BREAKPOINT_X; 
     attr.disabled = 0;
+    /* 此时编译器已经认识 wuwa_hbp_handler */
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
     return IS_ERR(bp) ? NULL : bp;
 }
@@ -300,7 +307,7 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         uint64_t target_addr = regs->regs[1] + 0x1C;
         uint32_t flag_val = 0;
-        /* [修复点] NMI 上下文地址合法性防御，严防无效指针导致缺页引发硬重启 */
+        /* NMI 上下文地址合法性防御，严防无效指针导致缺页引发硬重启 */
         if (target_addr > 0x10000 && target_addr < 0x7FFFFFFFF000ULL) {
             if (fn_copy_nofault && fn_copy_nofault(&flag_val, (void *)target_addr, 4) == 0 && flag_val == 1) { 
                 regs->sp -= 0x40; regs->pc += 4; return; 
@@ -502,7 +509,7 @@ __nocfi static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_reg
         int old_count; struct fake_perf_event *fake; int fd;
         do {
             old_count = atomic_read(&fake_perf_count);
-            /* [修复点] 彻底解耦伪装计算域与真实的驱动注入数量 */
+            /* 彻底解耦伪装计算域与真实的驱动注入数量 */
             if (old_count >= 128) { regs->regs[0] = -ENOSPC; return 0; }
         } while (atomic_cmpxchg(&fake_perf_count, old_count, old_count + 1) != old_count);
         
@@ -568,7 +575,7 @@ static void inject_worker_handler(struct work_struct *w) {
         tsk = pid_task(pid_struct, PIDTYPE_PID);
         if (tsk && g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
             mutex_lock(&g_bp_mutex);
-            /* [修复点] 工作队列中的 OOB 防御 */
+            /* 工作队列中的 OOB 防御 */
             if (g_lib_base) SAFE_INSTALL_BP(tsk, g_lib_base + HIJACK_OFFSET);
             if (g_cfg.border_on) SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_border);
             if (g_cfg.skip_on)   SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_pause_win);
