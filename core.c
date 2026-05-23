@@ -4,7 +4,7 @@
  * Description:  Ghost Core Engine V27.6 (Android 15 / Kernel 6.6 Optimized)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
  * Status:  Production Ready (Strict __must_check / Maple Tree / HBP Hijacking)
- * Integration:  Control Flow Hijacking for libtersafe.so @ 0x558A50
+ * Integration:  Control Flow Hijacking for libtersafe.so @ 0x558A50 + Kill-67 Logic
  * =====================================================================================
  */
 
@@ -64,6 +64,11 @@ MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Maple Tree & Strict Bounds")
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
 #endif
 
+/* AArch64 PSTATE Zero Flag 掩码 (Bit 30) */
+#ifndef PSR_Z_BIT
+#define PSR_Z_BIT 0x40000000
+#endif
+
 #ifndef PTE_ADDR_MASK
 #define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
 #endif
@@ -94,6 +99,9 @@ struct wuwa_hbp_req {
     int      border_on;
     int      skip_on;
     int      damage_on;
+    /* --- 新增：干掉67值相关的通信字段 --- */
+    int      kill67_on;
+    uint64_t off_kill67;   /* 推荐对应地址: 0x1DEE00 */
 };
 
 struct wuwa_hbp_pkt {
@@ -259,6 +267,21 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
         return;
     }
 
+    /* ===== 核心：干掉 67 (0x43) 状态机校验 ===== */
+    if (g_cfg.kill67_on && pc == base + g_cfg.off_kill67) {
+        /*
+         * 目标指令 (0x1DEE00): CMP W8, #0x43
+         * 后续指令 (0x1DEE04): MOV W8, #0x5968B6AF
+         * 处理策略：
+         * 不实际执行 CMP，直接将 CPU 状态寄存器 (PSTATE) 中的 Z(Zero) 标志位置 1，
+         * 并将 PC 向下偏移 4 字节跳过 CMP 指令。
+         * 这将欺骗后续位于 0x1DE84C 的 CSEL W8, W8, W10, EQ 指令，强制走入成功分支。
+         */
+        regs->pstate |= PSR_Z_BIT; 
+        regs->pc += 4;             
+        return;
+    }
+
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
         regs->regs[0] = 0; 
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
@@ -334,6 +357,8 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+    /* 挂载 67 校验的物理断点 */
+    if (req->kill67_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill67); if (bp) g_bps[g_bp_count++] = bp; }
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -572,6 +597,8 @@ static void inject_worker_handler(struct work_struct *w) {
             if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
             if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
+            /* 线程池创建时挂载 67 校验物理断点 */
+            if (g_cfg.kill67_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill67); if (bp) g_bps[g_bp_count++] = bp; }
             mutex_unlock(&g_bp_mutex);
         }
         put_pid(pid_struct);
