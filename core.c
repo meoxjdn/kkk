@@ -1,10 +1,10 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.6 (Android 15 / Kernel 6.6 Optimized)
+ * Description:  Ghost Core Engine V27.7 (Android 15 / Kernel 6.6 Optimized)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
- * Status:  Production Ready (Strict __must_check / Maple Tree / HBP Hijacking)
- * Integration:  Control Flow Hijacking for libtersafe.so @ 0x558A50 + Kill-67 Logic
+ * Status:  Production Ready (Strict Bounds Fix / NMI Safe / No Kernel Panic)
+ * Integration:  Control Flow Hijacking for libtersafe.so + Auto Kill67
  * =====================================================================================
  */
 
@@ -38,18 +38,18 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("GhostExpert");
-MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Maple Tree & Strict Bounds");
+MODULE_DESCRIPTION("V27.7 AArch64 HBP Hijacker with Anti-Deadlock Framework");
 
-/* ===== 核心配置：劫持目标 libtersafe.so ===== */
+/* ===== 核心配置 ===== */
 #define TARGET_LIB_NAME    "libtersafe.so"
 #define HIJACK_OFFSET      0x558A50
 
-/* 强制 Clang 放弃对特定函数进行 CFI 校验 */
 #ifndef __nocfi
 #define __nocfi __attribute__((no_sanitize("cfi")))
 #endif
 
-#define MAX_BPS          512 
+/* [修复点] 提升最大断点容量，适应多线程引擎疯狂创建的短生命周期线程 */
+#define MAX_BPS          2048 
 #define ARM64_MAX_HW_BPS 6
 #define GHOST_MAGIC      0xDEADBEEF5A5A1001ULL
 
@@ -64,7 +64,7 @@ MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Maple Tree & Strict Bounds")
     ((unsigned long)(ptr) & ((1UL << 52) - 1))
 #endif
 
-/* AArch64 PSTATE Zero Flag 掩码 (Bit 30) */
+/* PSTATE Z 标志位 */
 #ifndef PSR_Z_BIT
 #define PSR_Z_BIT 0x40000000
 #endif
@@ -99,9 +99,8 @@ struct wuwa_hbp_req {
     int      border_on;
     int      skip_on;
     int      damage_on;
-    /* --- 新增：干掉67值相关的通信字段 --- */
     int      kill67_on;
-    uint64_t off_kill67;   /* 推荐对应地址: 0x1DEE00 */
+    uint64_t off_kill67;   
 };
 
 struct wuwa_hbp_pkt {
@@ -170,9 +169,15 @@ static unreg_fn_t             fn_unregister = NULL;
 static kallsyms_lookup_name_t ghost_kallsyms = NULL;
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
 
-/* -------------------------------------------------------------------------
- * 内核态遍历 VMA 检索模块基址 (适配 Linux 6.1+ Maple Tree)
- * ------------------------------------------------------------------------- */
+/* [修复点] 安全断点注入宏，根绝 g_bps 越界写入引发的 Kernel Panic */
+#define SAFE_INSTALL_BP(tsk, addr) \
+    do { \
+        if (g_bp_count < MAX_BPS) { \
+            struct perf_event *__bp = install_bp((tsk), (addr)); \
+            if (__bp) g_bps[g_bp_count++] = __bp; \
+        } \
+    } while (0)
+
 static uint64_t find_lib_base_kernel(struct task_struct *task, const char *lib_name) {
     struct mm_struct *mm = get_task_mm(task);
     struct vm_area_struct *vma;
@@ -251,9 +256,18 @@ out_unlock:
     return ret;
 }
 
-/* -------------------------------------------------------------------------
- * 硬件断点劫持处理器
- * ------------------------------------------------------------------------- */
+__nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
+    struct perf_event_attr attr; 
+    struct perf_event *bp;
+    hw_breakpoint_init(&attr);
+    attr.bp_addr = addr; 
+    attr.bp_len = HW_BREAKPOINT_LEN_4; 
+    attr.bp_type = HW_BREAKPOINT_X; 
+    attr.disabled = 0;
+    bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
+    return IS_ERR(bp) ? NULL : bp;
+}
+
 __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc, base, l_base;
     if (unlikely(!regs)) return;
@@ -261,22 +275,12 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     base = READ_ONCE(g_game_base);
     l_base = READ_ONCE(g_lib_base);
 
-    /* 劫持点：libtersafe 强制拦截，阻断自检执行流 */
     if (l_base != 0 && pc == l_base + HIJACK_OFFSET) {
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
         return;
     }
 
-    /* ===== 核心：干掉 67 (0x43) 状态机校验 ===== */
     if (g_cfg.kill67_on && pc == base + g_cfg.off_kill67) {
-        /*
-         * 目标指令 (0x1DEE00): CMP W8, #0x43
-         * 后续指令 (0x1DEE04): MOV W8, #0x5968B6AF
-         * 处理策略：
-         * 不实际执行 CMP，直接将 CPU 状态寄存器 (PSTATE) 中的 Z(Zero) 标志位置 1，
-         * 并将 PC 向下偏移 4 字节跳过 CMP 指令。
-         * 这将欺骗后续位于 0x1DE84C 的 CSEL W8, W8, W10, EQ 指令，强制走入成功分支。
-         */
         regs->pstate |= PSR_Z_BIT; 
         regs->pc += 4;             
         return;
@@ -296,8 +300,11 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     if (g_cfg.damage_on && pc == base + g_cfg.off_damage) {
         uint64_t target_addr = regs->regs[1] + 0x1C;
         uint32_t flag_val = 0;
-        if (fn_copy_nofault && fn_copy_nofault(&flag_val, (void *)target_addr, 4) == 0 && flag_val == 1) { 
-            regs->sp -= 0x40; regs->pc += 4; return; 
+        /* [修复点] NMI 上下文地址合法性防御，严防无效指针导致缺页引发硬重启 */
+        if (target_addr > 0x10000 && target_addr < 0x7FFFFFFFF000ULL) {
+            if (fn_copy_nofault && fn_copy_nofault(&flag_val, (void *)target_addr, 4) == 0 && flag_val == 1) { 
+                regs->sp -= 0x40; regs->pc += 4; return; 
+            }
         }
         regs->regs[0] = 1; regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); 
         return;
@@ -317,20 +324,8 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     }
 }
 
-__nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
-    struct perf_event_attr attr; 
-    struct perf_event *bp;
-    hw_breakpoint_init(&attr);
-    attr.bp_addr = addr; 
-    attr.bp_len = HW_BREAKPOINT_LEN_4; 
-    attr.bp_type = HW_BREAKPOINT_X; 
-    attr.disabled = 0;
-    bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
-    return IS_ERR(bp) ? NULL : bp;
-}
-
 __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
-    struct task_struct *tsk; struct pid *pid_struct; struct perf_event *bp;
+    struct task_struct *tsk; struct pid *pid_struct; 
     pid_struct = find_get_pid(req->tid); 
     if (!pid_struct) return -ESRCH;
     tsk = pid_task(pid_struct, PIDTYPE_PID); 
@@ -344,21 +339,19 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         uint64_t l_base = find_lib_base_kernel(tsk, TARGET_LIB_NAME);
         if (l_base != 0) {
             WRITE_ONCE(g_lib_base, l_base);
-            bp = install_bp(tsk, l_base + HIJACK_OFFSET);
-            if (bp) g_bps[g_bp_count++] = bp;
+            SAFE_INSTALL_BP(tsk, l_base + HIJACK_OFFSET);
         }
     }
     
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
     smp_mb(); 
     
-    if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-    if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill); if (bp) g_bps[g_bp_count++] = bp; }
-    /* 挂载 67 校验的物理断点 */
-    if (req->kill67_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill67); if (bp) g_bps[g_bp_count++] = bp; }
+    if (req->border_on) SAFE_INSTALL_BP(tsk, req->base_addr + req->off_border);
+    if (req->skip_on)   SAFE_INSTALL_BP(tsk, req->base_addr + req->off_pause_win);
+    if (req->damage_on) SAFE_INSTALL_BP(tsk, req->base_addr + req->off_damage);
+    if (req->fov_on)    SAFE_INSTALL_BP(tsk, req->base_addr + req->off_fov);
+    if (req->maxhp_on)  SAFE_INSTALL_BP(tsk, req->base_addr + req->off_kill);
+    if (req->kill67_on) SAFE_INSTALL_BP(tsk, req->base_addr + req->off_kill67);
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
@@ -386,9 +379,6 @@ static void build_dynamic_sample(void *buffer, int seq) {
     header->size += 16; header->size = ALIGN(header->size, 8);
 }
 
-/* -------------------------------------------------------------------------
- * 伪造事件推送 (修复 __must_check 返回值)
- * ------------------------------------------------------------------------- */
 static void ghost_feed_event(struct fake_perf_event *fake) {
     int seq = atomic_inc_return(&fake->event_seq);
     if (fake->mmap_active && fake->rb_user_addr && fake->mmap_page) {
@@ -412,7 +402,6 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
         base = fake->rb_user_addr + data_offset; 
         chunk1 = data_size - offset;
 
-        /* 严格校验返回值，如果写入 Ring 3 失败，立即丢弃本次采样，防止内存指针越界 */
         if (h->size <= chunk1) { 
             if (copy_to_user(base + offset, sample_buf, h->size)) return;
         } else { 
@@ -423,9 +412,7 @@ static void ghost_feed_event(struct fake_perf_event *fake) {
         smp_wmb(); 
         header.data_head = head + h->size;
         
-        if (copy_to_user(fake->rb_user_addr, &header, sizeof(header))) {
-            /* 静默处理元数据更新失败 */
-        }
+        if (copy_to_user(fake->rb_user_addr, &header, sizeof(header))) {}
     }
 }
 
@@ -453,10 +440,7 @@ static ssize_t ghost_perf_read(struct file *file, char __user *buf, size_t count
     build_dynamic_sample(sample_buf, seq);
     cp_size = min_t(size_t, count, (size_t)((struct perf_event_header*)sample_buf)->size);
     
-    /* 严格校验跨态写入 */
-    if (copy_to_user(buf, sample_buf, cp_size)) {
-        return -EFAULT;
-    }
+    if (copy_to_user(buf, sample_buf, cp_size)) { return -EFAULT; }
     return cp_size;
 }
 
@@ -518,7 +502,8 @@ __nocfi static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_reg
         int old_count; struct fake_perf_event *fake; int fd;
         do {
             old_count = atomic_read(&fake_perf_count);
-            if (g_bp_count + old_count >= ARM64_MAX_HW_BPS) { regs->regs[0] = -ENOSPC; return 0; }
+            /* [修复点] 彻底解耦伪装计算域与真实的驱动注入数量 */
+            if (old_count >= 128) { regs->regs[0] = -ENOSPC; return 0; }
         } while (atomic_cmpxchg(&fake_perf_count, old_count, old_count + 1) != old_count);
         
         fake = kzalloc(sizeof(*fake), GFP_KERNEL);
@@ -558,9 +543,6 @@ __nocfi static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * Ptrace 返回值容错修复
- * ------------------------------------------------------------------------- */
 __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
     long ret = regs_return_value(regs);
@@ -568,15 +550,10 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
     if (stash->is_fake_target && ret == -EFAULT) {
         struct user_hwdebug_state *target = (stash->target_ledger == 1) ? &g_fake_break_ledger : &g_fake_watch_ledger;
         if (stash->request == PTRACE_SETREGSET && stash->iov.iov_len <= sizeof(*target)) {
-            /* 严格检查，如果失败直接中断 */
-            if (copy_from_user(target, stash->iov.iov_base, stash->iov.iov_len)) {
-                return 0; 
-            }
+            if (copy_from_user(target, stash->iov.iov_base, stash->iov.iov_len)) { return 0; }
             regs->regs[0] = 0; 
         } else if (stash->request == PTRACE_GETREGSET) {
-            if (copy_to_user(stash->iov.iov_base, target, min_t(size_t, stash->iov.iov_len, sizeof(*target)))) {
-                return 0;
-            }
+            if (copy_to_user(stash->iov.iov_base, target, min_t(size_t, stash->iov.iov_len, sizeof(*target)))) { return 0; }
             regs->regs[0] = 0;
         }
     }
@@ -585,20 +562,20 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
 
 static void inject_worker_handler(struct work_struct *w) {
     struct inject_work *iw = container_of(w, struct inject_work, work);
-    struct task_struct *tsk; struct pid *pid_struct; struct perf_event *bp;
+    struct task_struct *tsk; struct pid *pid_struct; 
     pid_struct = find_get_pid(iw->new_tid);
     if (pid_struct) {
         tsk = pid_task(pid_struct, PIDTYPE_PID);
         if (tsk && g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
             mutex_lock(&g_bp_mutex);
-            if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov); if (bp) g_bps[g_bp_count++] = bp; }
-            if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill); if (bp) g_bps[g_bp_count++] = bp; }
-            /* 线程池创建时挂载 67 校验物理断点 */
-            if (g_cfg.kill67_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill67); if (bp) g_bps[g_bp_count++] = bp; }
+            /* [修复点] 工作队列中的 OOB 防御 */
+            if (g_lib_base) SAFE_INSTALL_BP(tsk, g_lib_base + HIJACK_OFFSET);
+            if (g_cfg.border_on) SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_border);
+            if (g_cfg.skip_on)   SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_pause_win);
+            if (g_cfg.damage_on) SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_damage);
+            if (g_cfg.fov_on)    SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_fov);
+            if (g_cfg.maxhp_on)  SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_kill);
+            if (g_cfg.kill67_on) SAFE_INSTALL_BP(tsk, g_game_base + g_cfg.off_kill67);
             mutex_unlock(&g_bp_mutex);
         }
         put_pid(pid_struct);
