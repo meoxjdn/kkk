@@ -86,6 +86,7 @@ struct wuwa_hbp_req {
     uint64_t off_fov_gadget; 
     int      maxhp_on;
     uint64_t fov_val;      
+    uint64_t off_lib_script;
     int      fov_reg;      
     int      fov_is_ptr;   
     int      fov_pc_step;  
@@ -93,6 +94,7 @@ struct wuwa_hbp_req {
     int      border_on;
     int      skip_on;
     int      damage_on;
+    int      script_on;
 };
 
 struct wuwa_hbp_pkt {
@@ -288,6 +290,13 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1; regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); return;
     }
+
+// 插入在现有 HIJACK_OFFSET 处理之后，其他 base 相关分支之前
+if (g_cfg.script_on && l_base != 0 && pc == l_base + g_cfg.off_lib_script) {
+    regs->regs[21] = 1;     // 模拟 MOV W21, #1
+    regs->pc += 4;          // 跳过原指令（4 字节）
+    return;
+}
 
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
