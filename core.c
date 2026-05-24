@@ -1,10 +1,11 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.6 (Android 15 / Active Yielding Edition)
+ * Description:  Ghost Core Engine V27.6 (Android 15 / Active Yielding / Unexported Fix)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
- * Status:  Production Ready (Strict __must_check / Maple Tree / Slot Yielding)
- * Integration:  Control Flow Hijacking for libtersafe.so @ 0x558A50
+ * Status:  Production Ready (Dynamic Symbol Resolution / Maple Tree / Slot Yielding)
+ * Integration 1: Control Flow Hijacking for libtersafe.so @ 0x558A50
+ * Integration 2: Control Flow Hijacking for libGameCore.so @ 0x40A1D38 (MOV W21, #1)
  * =====================================================================================
  */
 
@@ -39,11 +40,14 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("GhostExpert");
-MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Dynamic Yielding");
+MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Dynamic Symbol Resolution");
 
-/* ===== 核心配置：劫持目标 libtersafe.so ===== */
-#define TARGET_LIB_NAME    "libtersafe.so"
-#define HIJACK_OFFSET      0x558A50
+/* ===== 核心配置：多目标劫持 ===== */
+#define TARGET_LIB_NAME      "libtersafe.so"
+#define HIJACK_OFFSET        0x558A50
+
+#define TARGET_CORE_NAME     "libGameCore.so"
+#define CORE_HIJACK_OFFSET   0x40A1D38
 
 #ifndef __nocfi
 #define __nocfi __attribute__((no_sanitize("cfi")))
@@ -86,6 +90,7 @@ struct wuwa_hbp_req {
     uint64_t off_fov_gadget; 
     int      maxhp_on;
     uint64_t fov_val;      
+    int      script_on;             // 开关（1 开启，0 关闭）
     uint64_t off_lib_script;
     int      fov_reg;      
     int      fov_is_ptr;   
@@ -94,7 +99,6 @@ struct wuwa_hbp_req {
     int      border_on;
     int      skip_on;
     int      damage_on;
-    int      script_on;
 };
 
 struct wuwa_hbp_pkt {
@@ -142,12 +146,13 @@ struct inject_work {
 static int               g_target_tgid = 0;
 static uint64_t          g_game_base   = 0;
 static uint64_t          g_lib_base    = 0; 
+static uint64_t          g_core_base   = 0; /* libGameCore 基址 */
 static struct perf_event *g_bps[MAX_BPS];
 static int               g_bp_count    = 0;
 static struct wuwa_hbp_req g_cfg;
 static DEFINE_MUTEX(g_bp_mutex);
 
-static int               g_yielded_flag = 0; /* 0=正常, 1=已退让给反作弊 */
+static int               g_yielded_flag = 0;
 
 /* 反作弊伪装层 */
 static struct user_hwdebug_state g_fake_break_ledger;
@@ -165,24 +170,27 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 
 static reg_fn_t               fn_register   = NULL;
 static unreg_fn_t             fn_unregister = NULL;
+static void                   *fn_force_sig = NULL; /* 动态符号指针：绕过未导出限制 */
 static kallsyms_lookup_name_t ghost_kallsyms = NULL;
 static long (*fn_copy_nofault)(void *dst, const void *src, size_t size) = NULL;
 
 __nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, perf_overflow_handler_t handler);
 
 /* -------------------------------------------------------------------------
- * 反作弊主动陷阱 Handler (API 断层修复)
+ * 反作弊主动陷阱 Handler (动态符号指针版，避免 EXPORT_SYMBOL 限制)
  * ------------------------------------------------------------------------- */
 __nocfi static void ac_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     if (unlikely(!regs)) return;
     
+    if (fn_force_sig) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
-    /* Linux 5.3+ 及 Android 15 移除了 current 参数 */
-    force_sig_fault(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc);
+        /* 强转函数指针签名，适配 Linux 6.6 的 3 参数 ABI */
+        ((int (*)(int, int, void __user *))fn_force_sig)(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc);
 #else
-    /* 兼容老版本内核 */
-    force_sig_fault(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc, current);
+        /* 强转函数指针签名，适配旧内核的 4 参数 ABI */
+        ((int (*)(int, int, void __user *, struct task_struct *))fn_force_sig)(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc, current);
 #endif
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -259,12 +267,21 @@ out_unlock:
 }
 
 __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
-    uint64_t pc, base, l_base;
+    uint64_t pc, base, l_base, c_base;
     if (unlikely(!regs)) return;
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
     l_base = READ_ONCE(g_lib_base);
+    c_base = READ_ONCE(g_core_base);
 
+    /* 劫持 1：libGameCore.so 寄存器强制赋值 (MOV W21, #1) */
+    if (c_base != 0 && pc == c_base + CORE_HIJACK_OFFSET) {
+        regs->regs[21] = 1;
+        regs->pc += 4; /* 步进跳过原始指令 */
+        return;
+    }
+
+    /* 劫持 2：libtersafe 控制流阻断 */
     if (l_base != 0 && pc == l_base + HIJACK_OFFSET) {
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
         return;
@@ -273,6 +290,13 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     if (g_cfg.border_on && pc == base + g_cfg.off_border) { 
         regs->regs[0] = 0; regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); return; 
     }
+    
+    // 插入在现有 HIJACK_OFFSET 处理之后，其他 base 相关分支之前
+if (g_cfg.script_on && l_base != 0 && pc == l_base + g_cfg.off_lib_script) {
+    regs->regs[21] = 1;     // 模拟 MOV W21, #1
+    regs->pc += 4;          // 跳过原指令（4 字节）
+    return;
+}
     
     if (g_cfg.skip_on && pc == base + g_cfg.off_pause_win) { 
         regs->pc = base + g_cfg.off_pause_jmp; return; 
@@ -290,13 +314,6 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     if (g_cfg.maxhp_on && pc == base + g_cfg.off_kill) {
         regs->regs[0] = 1; regs->pc = ptrauth_strip_insn_pac(regs->regs[30]); return;
     }
-
-// 插入在现有 HIJACK_OFFSET 处理之后，其他 base 相关分支之前
-if (g_cfg.script_on && l_base != 0 && pc == l_base + g_cfg.off_lib_script) {
-    regs->regs[21] = 1;     // 模拟 MOV W21, #1
-    regs->pc += 4;          // 跳过原指令（4 字节）
-    return;
-}
 
     if (g_cfg.fov_on && pc == base + g_cfg.off_fov) { 
         if (g_cfg.fov_is_ptr && g_cfg.fov_reg >= 0 && g_cfg.fov_reg <= 30) {
@@ -325,19 +342,32 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (g_bp_count == 0) {
         g_target_tgid = tsk->tgid; 
         WRITE_ONCE(g_game_base, req->base_addr);
+        
         uint64_t l_base = find_lib_base_kernel(tsk, TARGET_LIB_NAME);
         if (l_base != 0) {
             WRITE_ONCE(g_lib_base, l_base);
             bp = install_bp(tsk, l_base + HIJACK_OFFSET, wuwa_hbp_handler);
             if (bp) g_bps[g_bp_count++] = bp;
         }
+
+        /* 捕获并劫持 libGameCore.so */
+        uint64_t c_base = find_lib_base_kernel(tsk, TARGET_CORE_NAME);
+        if (c_base != 0) {
+            WRITE_ONCE(g_core_base, c_base);
+            bp = install_bp(tsk, c_base + CORE_HIJACK_OFFSET, wuwa_hbp_handler);
+            if (bp) g_bps[g_bp_count++] = bp;
+        }
     }
-    memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req)); smp_mb(); 
+    
+    memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req));
+    smp_mb(); 
+    
     if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_fov, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
     if (req->maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_kill, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+    
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
 }
@@ -351,7 +381,7 @@ __nocfi void wuwa_cleanup_perf_hbp(void) {
         if (g_ac_bps[i]) { perf_event_disable(g_ac_bps[i]); if (fn_unregister) fn_unregister(g_ac_bps[i]); g_ac_bps[i] = NULL; }
     }
     g_bp_count = 0; g_yielded_flag = 0;
-    WRITE_ONCE(g_game_base, 0); WRITE_ONCE(g_lib_base, 0); g_target_tgid = 0;
+    WRITE_ONCE(g_game_base, 0); WRITE_ONCE(g_lib_base, 0); WRITE_ONCE(g_core_base, 0); g_target_tgid = 0;
     memset(&g_cfg, 0, sizeof(struct wuwa_hbp_req));
     memset(&g_fake_break_ledger, 0, sizeof(g_fake_break_ledger));
     smp_mb(); mutex_unlock(&g_bp_mutex);
@@ -474,7 +504,7 @@ __nocfi static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt
 }
 
 /* -------------------------------------------------------------------------
- * 异步复苏 Handler (复原退让的断点)
+ * 异步复苏 Handler
  * ------------------------------------------------------------------------- */
 static void restore_worker_handler(struct work_struct *w) {
     struct inject_work *iw = container_of(w, struct inject_work, work);
@@ -482,7 +512,7 @@ static void restore_worker_handler(struct work_struct *w) {
     
     mutex_lock(&g_bp_mutex);
     memcpy(&req_copy, &g_cfg, sizeof(struct wuwa_hbp_req));
-    req_copy.tid = iw->new_tid; /* 为当前退让结束的线程恢复 */
+    req_copy.tid = iw->new_tid;
     mutex_unlock(&g_bp_mutex);
     
     if (req_copy.base_addr != 0) {
@@ -510,7 +540,6 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
                 if (incoming.dbg_regs[i].ctrl & 1) ac_active++;
             }
             
-            /* 1. 动态退让核心逻辑：当反作弊索要大量坑位，我们主动卸载让贤 */
             if (g_bp_count > 0 && (g_bp_count + ac_active > ARM64_MAX_HW_BPS)) {
                 for (i = 0; i < g_bp_count; i++) {
                     if (g_bps[i]) {
@@ -522,7 +551,6 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
                 g_bp_count = 0;
                 g_yielded_flag = 1;
             } 
-            /* 2. 异步复苏逻辑：当反作弊查房结束撤销断点，唤醒我们的业务 */
             else if (ac_active == 0 && g_yielded_flag == 1 && g_cfg.base_addr != 0) {
                 struct inject_work *iw = kmalloc(sizeof(*iw), GFP_ATOMIC);
                 if (iw) {
@@ -533,7 +561,6 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
                 g_yielded_flag = 0;
             }
 
-            /* 3. 真实断点投递 */
             for (i = 0; i < ARM64_MAX_HW_BPS; i++) {
                 int enabled = incoming.dbg_regs[i].ctrl & 1;
                 uint64_t ac_addr = incoming.dbg_regs[i].addr;
@@ -571,6 +598,7 @@ static void inject_worker_handler(struct work_struct *w) {
             mutex_lock(&g_bp_mutex);
             if (!g_yielded_flag) {
                 if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_core_base) { bp = install_bp(tsk, g_core_base + CORE_HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -634,11 +662,14 @@ static int __init ghost_core_init(void) {
     if (register_kprobe(&kp) < 0) return -ENOSYS;
     ghost_kallsyms = (kallsyms_lookup_name_t)kp.addr; unregister_kprobe(&kp);
     
+    /* 使用 kallsyms 动态解析所有未导出的内部符号 */
     fn_register = (reg_fn_t)ghost_kallsyms("register_user_hw_breakpoint");
     fn_unregister = (unreg_fn_t)ghost_kallsyms("unregister_hw_breakpoint");
+    fn_force_sig = (void *)ghost_kallsyms("force_sig_fault");
     fn_copy_nofault = (void *)ghost_kallsyms("copy_from_user_nofault");
+    
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("copy_from_kernel_nofault");
-    if (!fn_register || !fn_unregister) return -ENOSYS;
+    if (!fn_register || !fn_unregister || !fn_force_sig) return -ENOSYS;
     
     for (i = 0; i < 4; i++) { 
         wuwa_nl_sk = netlink_kernel_create(&init_net, ports[i], &nl_cfg); 
