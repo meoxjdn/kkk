@@ -4,7 +4,7 @@
  * Description:  Ghost Core Engine V27.6 (Android 15 / Active Yielding / Unexported Fix)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
  * Status:  Production Ready (Dynamic Symbol Resolution / Maple Tree / Slot Yielding)
- * Integration: Control Flow Hijacking + Custom script_on Feature
+ * Integration: Control Flow Hijacking + Custom script_on Feature + OOB Panic Fix
  * =====================================================================================
  */
 
@@ -388,10 +388,10 @@ static void ptrace_yield_worker(struct work_struct *w) {
         g_yielded_flag = 1;
     }
     else if (ac_active == 0 && g_yielded_flag == 1 && g_cfg.base_addr != 0) {
-        /* 反作弊撤销断点后，直接在此工作队列中恢复业务断点，消除多余的 restore 函数 */
+        /* 反作弊撤销断点后，直接在此工作队列中恢复业务断点，加上边界锁防止溢出！ */
         struct perf_event *bp;
-        if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-        if (g_cfg.script_on && g_game_base) { bp = install_bp(tsk, g_game_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_lib_base && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.script_on && g_game_base && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -468,14 +468,18 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         uint64_t l_base = find_lib_base_kernel(tsk, TARGET_LIB_NAME);
         if (l_base != 0) {
             WRITE_ONCE(g_lib_base, l_base);
-            bp = install_bp(tsk, l_base + HIJACK_OFFSET, wuwa_hbp_handler);
-            if (bp) g_bps[g_bp_count++] = bp;
+            /* 修正：增加数组边界保护 */
+            if (g_bp_count < MAX_BPS) {
+                bp = install_bp(tsk, l_base + HIJACK_OFFSET, wuwa_hbp_handler);
+                if (bp) g_bps[g_bp_count++] = bp;
+            }
         }
     }
     
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req)); smp_mb(); 
     
     if (!g_yielded_flag) {
+        /* 修正：全面增加数组边界保护 */
         if (req->script_on && g_game_base != 0 && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + req->off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -496,14 +500,15 @@ static void inject_worker_handler(struct work_struct *w) {
         tsk = pid_task(pid_struct, PIDTYPE_PID);
         if (tsk && g_target_tgid != 0 && tsk->tgid == g_target_tgid) {
             mutex_lock(&g_bp_mutex);
-            if (!g_yielded_flag) {
+            /* 修正：保命级防御，防止临时线程爆炸导致数组越界，保留最后 10 个安全槽位 */
+            if (!g_yielded_flag && g_bp_count < (MAX_BPS - 10)) {
                 if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.script_on && g_game_base) { bp = install_bp(tsk, g_game_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.border_on) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.skip_on)   { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.damage_on) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.fov_on)    { bp = install_bp(tsk, g_game_base + g_cfg.off_fov, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.maxhp_on)  { bp = install_bp(tsk, g_game_base + g_cfg.off_kill, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
             }
             mutex_unlock(&g_bp_mutex);
         }
