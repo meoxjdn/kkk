@@ -1,11 +1,10 @@
 /*
  * =====================================================================================
  * Filename:  core.c
- * Description:  Ghost Core Engine V27.6 (Android 15 / Kernel 6.6 / Active Yielding)
+ * Description:  Ghost Core Engine V27.6 (Android 15 / Active Yielding / Unexported Fix)
  * Architecture:  AArch64 (ARMv8-A + PAC Aware + Full CFI Immune)
- * Status:  Production Ready (Deadlock-Free / Asynchronous Yielding / SW_DUMMY Bypass)
- * Integration 1: Control Flow Hijacking for libtersafe.so @ 0x558A50
- * Integration 2: Control Flow Hijacking for libGameCore.so @ 0x40A1D38 (MOV W21, #1)
+ * Status:  Production Ready (Dynamic Symbol Resolution / Maple Tree / Slot Yielding)
+ * Integration: Control Flow Hijacking + Custom script_on Feature
  * =====================================================================================
  */
 
@@ -36,13 +35,11 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("GhostExpert");
-MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with Ultimate Anti-Cheat Defeat");
+MODULE_DESCRIPTION("V27.6 AArch64 HBP Hijacker with User Custom Script_On");
 
-/* ===== 核心配置：多目标劫持 ===== */
+/* ===== 核心配置：目标劫持 ===== */
 #define TARGET_LIB_NAME      "libtersafe.so"
 #define HIJACK_OFFSET        0x558A50
-#define TARGET_CORE_NAME     "libGameCore.so"
-#define CORE_HIJACK_OFFSET   0x40A1D38
 
 #ifndef __nocfi
 #define __nocfi __attribute__((no_sanitize("cfi")))
@@ -85,8 +82,8 @@ struct wuwa_hbp_req {
     uint64_t off_fov_gadget; 
     int      maxhp_on;
     uint64_t fov_val;      
-    int      script_on;
-    uint64_t off_lib_script;
+    int      script_on;             // 用户层传递：开关（1 开启，0 关闭）
+    uint64_t off_lib_script;        // 用户层传递：特定脚本偏移
     int      fov_reg;      
     int      fov_is_ptr;   
     int      fov_pc_step;  
@@ -108,7 +105,6 @@ struct wuwa_mem_req {
 };
 #pragma pack(pop)
 
-/* ====== 跨态劫持通讯仓 ====== */
 struct perf_stash {
     struct perf_event_attr attr;
     struct perf_event_attr __user *uptr;
@@ -136,19 +132,18 @@ struct ptrace_work {
     struct user_hwdebug_state incoming;
 };
 
-/* ===== 全局调度机 ===== */
+/* 核心变量与退让状态机 */
 static int               g_target_tgid = 0;
 static uint64_t          g_game_base   = 0;
 static uint64_t          g_lib_base    = 0; 
-static uint64_t          g_core_base   = 0; 
 static struct perf_event *g_bps[MAX_BPS];
 static int               g_bp_count    = 0;
 static struct wuwa_hbp_req g_cfg;
 static DEFINE_MUTEX(g_bp_mutex);
 
-static int               g_yielded_flag = 0; /* 物理槽位退让标志位 */
+static int               g_yielded_flag = 0;
 
-/* ===== 反作弊伪装隔离层 ===== */
+/* 反作弊伪装层 */
 static struct user_hwdebug_state g_fake_break_ledger;
 static struct user_hwdebug_state g_fake_watch_ledger;
 static struct perf_event *g_ac_bps[ARM64_MAX_HW_BPS]; 
@@ -171,14 +166,13 @@ static long (*fn_copy_to_user_nofault)(void __user *dst, const void *src, size_t
 __nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, perf_overflow_handler_t handler);
 
 /* -------------------------------------------------------------------------
- * 1. 反作弊主动陷阱 Handler (自适应 ABI)
+ * 反作弊主动陷阱 Handler (动态符号指针版)
  * ------------------------------------------------------------------------- */
 __nocfi static void ac_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     if (unlikely(!regs)) return;
     
     if (fn_force_sig) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 3, 0)
-        /* 兼容 Android 15 (Kernel 6.6) 三参数重构 */
         ((int (*)(int, int, void __user *))fn_force_sig)(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc);
 #else
         ((int (*)(int, int, void __user *, struct task_struct *))fn_force_sig)(SIGTRAP, TRAP_HWBKPT, (void __user *)regs->pc, current);
@@ -187,7 +181,7 @@ __nocfi static void ac_hbp_handler(struct perf_event *bp, struct perf_sample_dat
 }
 
 /* -------------------------------------------------------------------------
- * 2. 深度穿透：Linux 6.1+ Maple Tree 兼容扫描
+ * Linux 6.1+ Maple Tree VMA 解析
  * ------------------------------------------------------------------------- */
 static uint64_t find_lib_base_kernel(struct task_struct *task, const char *lib_name) {
     struct mm_struct *mm = get_task_mm(task);
@@ -211,6 +205,7 @@ static uint64_t find_lib_base_kernel(struct task_struct *task, const char *lib_n
             }
         }
     }
+
     mmap_read_unlock(mm);
     mmput(mm);
     return addr;
@@ -258,32 +253,22 @@ out_unlock:
     mmap_read_unlock(mm); mmput(mm); return ret;
 }
 
-/* -------------------------------------------------------------------------
- * 3. 核心业务：Ghost 控制流重定向 Handler
- * ------------------------------------------------------------------------- */
 __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
-    uint64_t pc, base, l_base, c_base;
+    uint64_t pc, base, l_base;
     if (unlikely(!regs)) return;
     pc = regs->pc; 
     base = READ_ONCE(g_game_base);
     l_base = READ_ONCE(g_lib_base);
-    c_base = READ_ONCE(g_core_base);
-
-    /* Lua 移植脚本：libGameCore.so 寄存器写入 (等效 MOV W21, #1) */
-    if (c_base != 0 && pc == c_base + CORE_HIJACK_OFFSET) {
-        regs->regs[21] = 1;
-        regs->pc += 4; 
-        return;
-    }
 
     if (l_base != 0 && pc == l_base + HIJACK_OFFSET) {
         regs->pc = ptrauth_strip_insn_pac(regs->regs[30]);
         return;
     }
-    
+
+    /* 用户态通过 script_on 传递的新逻辑 */
     if (g_cfg.script_on && l_base != 0 && pc == l_base + g_cfg.off_lib_script) {
-        regs->regs[21] = 1;     
-        regs->pc += 4;          
+        regs->regs[21] = 1;     // 模拟 MOV W21, #1
+        regs->pc += 4;          // 跳过原指令（4 字节）
         return;
     }
 
@@ -324,9 +309,6 @@ __nocfi static struct perf_event *install_bp(struct task_struct *tsk, uint64_t a
     return IS_ERR(bp) ? NULL : bp;
 }
 
-/* -------------------------------------------------------------------------
- * 4. 彻底抛弃易死机的旧 Fake File，采用 SW_DUMMY 热交换骗过反作弊
- * ------------------------------------------------------------------------- */
 __nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     struct perf_event_attr __user *attr_uptr = (struct perf_event_attr __user *)regs->regs[0];
@@ -337,11 +319,8 @@ __nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_r
             if (stash->attr.type == PERF_TYPE_BREAKPOINT) {
                 uint32_t fake_type = PERF_TYPE_SOFTWARE;
                 uint64_t fake_config = PERF_COUNT_SW_DUMMY;
-                
-                /* 原子上下文中绝对安全的静默覆盖，让内核生成毫无威胁的 Dummy FD */
                 fn_copy_to_user_nofault(&attr_uptr->type, &fake_type, sizeof(fake_type));
                 fn_copy_to_user_nofault(&attr_uptr->config, &fake_config, sizeof(fake_config));
-                
                 stash->is_fake_target = true;
                 stash->uptr = attr_uptr;
             }
@@ -353,21 +332,17 @@ __nocfi static int entry_handler_perf(struct kretprobe_instance *ri, struct pt_r
 __nocfi static int ret_handler_perf(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct perf_stash *stash = (struct perf_stash *)ri->data;
     if (stash->is_fake_target && fn_copy_to_user_nofault) {
-        /* 返回时将用户态结构抹除作弊痕迹，反作弊拿到了真 FD 且毫无察觉 */
         fn_copy_to_user_nofault(&stash->uptr->type, &stash->attr.type, sizeof(stash->attr.type));
         fn_copy_to_user_nofault(&stash->uptr->config, &stash->attr.config, sizeof(stash->attr.config));
     }
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * 5. PTRACE 异步退让系统 (彻底解决 kretprobe 睡眠死机)
- * ------------------------------------------------------------------------- */
 __nocfi static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct ptrace_stash *stash = (struct ptrace_stash *)ri->data;
     long addr = regs->regs[2];
     stash->request = regs->regs[0]; 
-    stash->target_pid = regs->regs[1]; /* 捕获真实 Tracee PID */
+    stash->target_pid = regs->regs[1];
     stash->data = (void __user *)regs->regs[3]; 
     stash->is_fake_target = false;
     
@@ -376,7 +351,7 @@ __nocfi static int entry_handler_ptrace(struct kretprobe_instance *ri, struct pt
     
     if (stash->is_fake_target && fn_copy_nofault) {
         if (fn_copy_nofault(&stash->iov, stash->data, sizeof(struct iovec)) == 0) {
-            regs->regs[3] = 0; /* 强制产生 -EFAULT 拦截真实系统调用 */
+            regs->regs[3] = 0; 
         } else {
             stash->is_fake_target = false;
         }
@@ -400,7 +375,7 @@ static void ptrace_yield_worker(struct work_struct *w) {
 
     mutex_lock(&g_bp_mutex);
     
-    /* 核心战略：物理槽位动态退让 (Yielding) */
+    /* 核心战略：物理槽位动态退让与异步复苏合二为一 */
     if (g_bp_count > 0 && (g_bp_count + ac_active > ARM64_MAX_HW_BPS)) {
         for (i = 0; i < g_bp_count; i++) {
             if (g_bps[i]) {
@@ -412,8 +387,19 @@ static void ptrace_yield_worker(struct work_struct *w) {
         g_bp_count = 0;
         g_yielded_flag = 1;
     }
+    else if (ac_active == 0 && g_yielded_flag == 1 && g_cfg.base_addr != 0) {
+        /* 反作弊撤销断点后，直接在此工作队列中恢复业务断点，消除多余的 restore 函数 */
+        struct perf_event *bp;
+        if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.script_on && g_lib_base) { bp = install_bp(tsk, g_lib_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.fov_on    && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_fov, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.maxhp_on  && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_kill, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        g_yielded_flag = 0;
+    }
 
-    /* 核心防御：反作弊物理级断点接驳与异常分发重定向 */
     for (i = 0; i < ARM64_MAX_HW_BPS; i++) {
         int enabled = pw->incoming.dbg_regs[i].ctrl & 1;
         uint64_t ac_addr = pw->incoming.dbg_regs[i].addr;
@@ -443,13 +429,11 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
         struct user_hwdebug_state *target = (stash->target_ledger == 1) ? &g_fake_break_ledger : &g_fake_watch_ledger;
         
         if (stash->request == PTRACE_SETREGSET && stash->iov.iov_len <= sizeof(*target)) {
-            /* 采用完全安全的 GFP_ATOMIC 脱离休眠限制 */
             struct ptrace_work *pw = kzalloc(sizeof(*pw), GFP_ATOMIC);
             if (pw) {
                 pw->target_pid = stash->target_pid;
                 pw->target_ledger = stash->target_ledger;
                 if (fn_copy_nofault(&pw->incoming, stash->iov.iov_base, stash->iov.iov_len) == 0) {
-                    /* 同步账本数据，异步卸载/装载物理断点 */
                     memcpy(target, &pw->incoming, stash->iov.iov_len);
                     INIT_WORK(&pw->work, ptrace_yield_worker);
                     schedule_work(&pw->work);
@@ -469,9 +453,6 @@ __nocfi static int ret_handler_ptrace(struct kretprobe_instance *ri, struct pt_r
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * 挂载点初始化与多线程跟随
- * ------------------------------------------------------------------------- */
 __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct task_struct *tsk; struct pid *pid_struct; struct perf_event *bp;
     pid_struct = find_get_pid(req->tid); 
@@ -490,18 +471,12 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             bp = install_bp(tsk, l_base + HIJACK_OFFSET, wuwa_hbp_handler);
             if (bp) g_bps[g_bp_count++] = bp;
         }
-
-        uint64_t c_base = find_lib_base_kernel(tsk, TARGET_CORE_NAME);
-        if (c_base != 0) {
-            WRITE_ONCE(g_core_base, c_base);
-            bp = install_bp(tsk, c_base + CORE_HIJACK_OFFSET, wuwa_hbp_handler);
-            if (bp) g_bps[g_bp_count++] = bp;
-        }
     }
     
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req)); smp_mb(); 
     
     if (!g_yielded_flag) {
+        if (req->script_on && g_lib_base != 0 && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_lib_base + req->off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -511,21 +486,6 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct); return 0;
-}
-
-static void restore_worker_handler(struct work_struct *w) {
-    struct inject_work *iw = container_of(w, struct inject_work, work);
-    struct wuwa_hbp_req req_copy;
-    
-    mutex_lock(&g_bp_mutex);
-    memcpy(&req_copy, &g_cfg, sizeof(struct wuwa_hbp_req));
-    req_copy.tid = iw->new_tid;
-    mutex_unlock(&g_bp_mutex);
-    
-    if (req_copy.base_addr != 0) {
-        wuwa_install_perf_hbp(&req_copy);
-    }
-    kfree(iw);
 }
 
 static void inject_worker_handler(struct work_struct *w) {
@@ -538,7 +498,7 @@ static void inject_worker_handler(struct work_struct *w) {
             mutex_lock(&g_bp_mutex);
             if (!g_yielded_flag) {
                 if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_core_base) { bp = install_bp(tsk, g_core_base + CORE_HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.script_on && g_lib_base) { bp = install_bp(tsk, g_lib_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -570,7 +530,7 @@ __nocfi void wuwa_cleanup_perf_hbp(void) {
         if (g_ac_bps[i]) { perf_event_disable(g_ac_bps[i]); if (fn_unregister) fn_unregister(g_ac_bps[i]); g_ac_bps[i] = NULL; }
     }
     g_bp_count = 0; g_yielded_flag = 0;
-    WRITE_ONCE(g_game_base, 0); WRITE_ONCE(g_lib_base, 0); WRITE_ONCE(g_core_base, 0); g_target_tgid = 0;
+    WRITE_ONCE(g_game_base, 0); WRITE_ONCE(g_lib_base, 0); g_target_tgid = 0;
     memset(&g_cfg, 0, sizeof(struct wuwa_hbp_req));
     memset(&g_fake_break_ledger, 0, sizeof(g_fake_break_ledger));
     smp_mb(); mutex_unlock(&g_bp_mutex);
@@ -624,7 +584,6 @@ static int __init ghost_core_init(void) {
     fn_copy_nofault = (void *)ghost_kallsyms("copy_from_user_nofault");
     if (!fn_copy_nofault) fn_copy_nofault = (void *)ghost_kallsyms("probe_kernel_read");
     
-    /* 解决 Android 15 强制 copy_to_user 异常的终极兵器 */
     fn_copy_to_user_nofault = (void *)ghost_kallsyms("copy_to_user_nofault");
     if (!fn_copy_to_user_nofault) fn_copy_to_user_nofault = (void *)ghost_kallsyms("probe_kernel_write");
     
