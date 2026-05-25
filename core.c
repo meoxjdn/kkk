@@ -391,7 +391,7 @@ static void ptrace_yield_worker(struct work_struct *w) {
         /* 反作弊撤销断点后，直接在此工作队列中恢复业务断点，消除多余的 restore 函数 */
         struct perf_event *bp;
         if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-        if (g_cfg.script_on && g_lib_base) { bp = install_bp(tsk, g_lib_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (g_cfg.script_on && g_game_base) { bp = install_bp(tsk, g_game_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
@@ -498,7 +498,7 @@ static void inject_worker_handler(struct work_struct *w) {
             mutex_lock(&g_bp_mutex);
             if (!g_yielded_flag) {
                 if (g_lib_base) { bp = install_bp(tsk, g_lib_base + HIJACK_OFFSET, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
-                if (g_cfg.script_on && g_lib_base) { bp = install_bp(tsk, g_lib_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+                if (g_cfg.script_on && g_game_base) { bp = install_bp(tsk, g_game_base + g_cfg.off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
                 if (g_cfg.damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + g_cfg.off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
