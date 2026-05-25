@@ -476,7 +476,7 @@ __nocfi int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     memcpy(&g_cfg, req, sizeof(struct wuwa_hbp_req)); smp_mb(); 
     
     if (!g_yielded_flag) {
-        if (req->script_on && g_lib_base != 0 && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_lib_base + req->off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
+        if (req->script_on && g_game_base != 0 && g_bp_count < MAX_BPS) { bp = install_bp(tsk, g_game_base + req->off_lib_script, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->border_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_border, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->skip_on   && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_pause_win, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
         if (req->damage_on && g_bp_count < MAX_BPS) { bp = install_bp(tsk, req->base_addr + req->off_damage, wuwa_hbp_handler); if (bp) g_bps[g_bp_count++] = bp; }
