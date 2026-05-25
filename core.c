@@ -266,7 +266,7 @@ __nocfi static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_d
     }
 
     /* 用户态通过 script_on 传递的新逻辑 */
-    if (g_cfg.script_on && l_base != 0 && pc == l_base + g_cfg.off_lib_script) {
+    if (g_cfg.script_on && base != 0 && pc == base + g_cfg.off_lib_script) {
         regs->regs[21] = 1;     // 模拟 MOV W21, #1
         regs->pc += 4;          // 跳过原指令（4 字节）
         return;
