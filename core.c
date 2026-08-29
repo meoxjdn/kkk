@@ -217,12 +217,16 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 typedef int (*patch_text_t)(void *addr, u32 insn);
 typedef int (*patch_text_sync_t)(void *addrs[], u32 insns[], int cnt);
 typedef int (*set_memory_t)(unsigned long addr, int numpages);
+typedef void (*mmu_notifier_invalidate_t)(struct mm_struct *mm,
+                                          unsigned long start,
+                                          unsigned long end);
 
 static kallsyms_lookup_name_t ghost_kallsyms;
 static patch_text_t           fn_patch_text;
 static patch_text_sync_t      fn_patch_text_sync;
 static set_memory_t           fn_set_memory_rw;
 static set_memory_t           fn_set_memory_ro;
+static mmu_notifier_invalidate_t fn_mmu_notifier_invalidate;
 
 /* ------------------------------------------------------------------
  * 模块隐身 + kallsyms 解析 (沿用旧驱动)
@@ -247,6 +251,24 @@ static int init_ghost_resolver(void)
     ghost_kallsyms = (kallsyms_lookup_name_t)kp.addr;
     unregister_kprobe(&kp);
     return 0;
+}
+
+/* ------------------------------------------------------------------
+ * mmu_notifier 转发 stub
+ * ------------------------------------------------------------------
+ * arm64 的 flush_tlb_range/mmu_notifier_arch_invalidate_secondary_tlbs
+ * 是内联函数, 会把对外部 __mmu_notifier_arch_invalidate_secondary_tlbs
+ * 的调用带进本模块, 而该符号在 GKI 里未导出, 导致 insmod 报
+ * "Unknown symbol ... (err -2)"。
+ * 这里在模块内定义一个同名同签名的全局转发函数: 链接期它自己满足
+ * 模块内的未定义引用, 运行时再转发到 kallsyms 解析出的真地址。
+ */
+void __mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
+                                                   unsigned long start,
+                                                   unsigned long end)
+{
+    if (fn_mmu_notifier_invalidate)
+        fn_mmu_notifier_invalidate(mm, start, end);
 }
 
 /* ------------------------------------------------------------------
@@ -1038,6 +1060,11 @@ static int __init ghost_core_init(void)
 
     if (init_ghost_resolver() < 0)
         return -ENOSYS;
+
+    fn_mmu_notifier_invalidate =
+        (mmu_notifier_invalidate_t)ghost_kallsyms("__mmu_notifier_arch_invalidate_secondary_tlbs");
+    if (!fn_mmu_notifier_invalidate)
+        pr_warn("android_wuwa: __mmu_notifier_arch_invalidate_secondary_tlbs 未解析, TLB flush 将降级为 no-op\n");
 
     g_dpf_addr = ghost_kallsyms("do_page_fault");
     fn_module_alloc = (module_alloc_t)ghost_kallsyms("module_alloc");
