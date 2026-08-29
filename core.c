@@ -375,8 +375,10 @@ static int ghost_page_set_uxn(struct mm_struct *mm, unsigned long uaddr, bool se
 
         for (i = 0; i < GHOST_CONT_PTES; i++) {
             if (pte_val(gbase[i]) & PTE_CONT)
-                set_pte_at(mm, gstart + i * PAGE_SIZE, &gbase[i],
-                           __pte(pte_val(gbase[i]) & ~PTE_CONT));
+                /* 裸写 PTE: 避免 set_pte_at 内联链引用未导出的
+                 * __sync_icache_dcache / mte_sync_tags / __contpte_try_fold,
+                 * 纯 UXN 位翻转不需要 icache/MTE 同步, CONT 展开与 TLB flush 已自行处理 */
+                WRITE_ONCE(gbase[i], __pte(pte_val(gbase[i]) & ~PTE_CONT));
         }
         spin_unlock(ptl);
         if (vma)
@@ -389,7 +391,7 @@ static int ghost_page_set_uxn(struct mm_struct *mm, unsigned long uaddr, bool se
     old = pte_val(*ptep);
     new = set ? (old | PTE_UXN) : (old & ~PTE_UXN);
     if (new != old) {
-        set_pte_at(mm, uaddr, ptep, __pte(new));
+        WRITE_ONCE(*ptep, __pte(new));
         spin_unlock(ptl);
         if (vma)
             flush_tlb_page(vma, uaddr);
