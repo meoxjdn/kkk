@@ -36,6 +36,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/mutex.h>
 #include <linux/kprobes.h>
@@ -56,6 +57,39 @@
 #include <asm/set_memory.h>
 #include <asm/memory.h>
 #endif
+
+/*
+ * 可执行内存分配: 走 kallsyms 运行时解析 (与 fn_patch_text 同套路)。
+ * module_alloc 在 6.12 被 execmem_alloc 取代, 且 execmem_alloc 未 EXPORT,
+ * 直接编译期引用会在 modpost 阶段报 undefined; 运行时解析可跨 5.10~6.12。
+ */
+typedef void *(*module_alloc_t)(size_t size);
+typedef void *(*execmem_alloc_t)(unsigned int type, size_t size);
+typedef void (*execmem_free_t)(void *ptr);
+
+static module_alloc_t  fn_module_alloc;
+static execmem_alloc_t fn_execmem_alloc;
+static execmem_free_t  fn_execmem_free;
+static bool            g_use_execmem;   /* 6.12+: execmem_alloc 路径 */
+
+static void *ghost_exec_alloc(size_t size)
+{
+    if (g_use_execmem && fn_execmem_alloc)
+        return fn_execmem_alloc(0, size);   /* EXECMEM_MODULE_TEXT == EXECMEM_DEFAULT == 0 */
+    if (fn_module_alloc)
+        return fn_module_alloc(size);
+    return NULL;
+}
+
+static void ghost_exec_free(void *ptr)
+{
+    if (!ptr)
+        return;
+    if (g_use_execmem && fn_execmem_free)
+        fn_execmem_free(ptr);
+    else
+        vfree(ptr);
+}
 
 MODULE_LICENSE("GPL");
 
@@ -622,7 +656,7 @@ static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long
  * 首个指令 mov x19, x0 (0xAA0003F3) 作为定位标记, 供运行时扫描
  * (兼容 -fpatchable-function-entry 在函数头预置的 NOP 槽)。
  */
-__attribute__((naked, noinline, notrace, used))
+__attribute__((naked, __noinline__, used))
 static void ghost_dpf_tramp(void)
 {
     __asm__ __volatile__(
@@ -664,6 +698,7 @@ static unsigned long ghost_locate_tramp(void)
     return 0;
 }
 
+static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long far) __attribute__((used));
 static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long far)
 {
     unsigned long pc, base;
@@ -815,7 +850,7 @@ static int ghost_patch_dpf(void)
 
     /* miss 回跳缓冲 (分配一次, 卸载时释放) */
     if (!g_orig_run_buf) {
-        g_orig_run_buf = module_alloc(PAGE_SIZE);
+        g_orig_run_buf = ghost_exec_alloc(PAGE_SIZE);
         if (!g_orig_run_buf)
             return -ENOMEM;
     }
@@ -1000,6 +1035,12 @@ static int __init ghost_core_init(void)
         return -ENOSYS;
 
     g_dpf_addr = ghost_kallsyms("do_page_fault");
+    fn_module_alloc = (module_alloc_t)ghost_kallsyms("module_alloc");
+    if (!fn_module_alloc) {
+        fn_execmem_alloc = (execmem_alloc_t)ghost_kallsyms("execmem_alloc");
+        fn_execmem_free  = (execmem_free_t)ghost_kallsyms("execmem_free");
+        g_use_execmem = fn_execmem_alloc && fn_execmem_free;
+    }
     fn_patch_text_sync = (patch_text_sync_t)ghost_kallsyms("aarch64_insn_patch_text_sync");
     fn_patch_text      = (patch_text_t)ghost_kallsyms("aarch64_insn_patch_text");
     fn_set_memory_rw   = (set_memory_t)ghost_kallsyms("set_memory_rw");
@@ -1008,6 +1049,8 @@ static int __init ghost_core_init(void)
     if (!g_dpf_addr)
         return -ENOSYS;
     if (!fn_patch_text_sync && !fn_patch_text)
+        return -ENOSYS;
+    if (!fn_module_alloc && !g_use_execmem)
         return -ENOSYS;
 
     memset(&nl_cfg, 0, sizeof(nl_cfg));
@@ -1029,7 +1072,7 @@ static void __exit ghost_core_exit(void)
         wuwa_nl_sk = NULL;
     }
     if (g_orig_run_buf) {
-        vfree(g_orig_run_buf);
+        ghost_exec_free(g_orig_run_buf);
         g_orig_run_buf = NULL;
     }
 }
