@@ -25,7 +25,8 @@
  *      并由延迟工作队列在 ~20ms 后重新武装(自愈, 不崩溃)。
  *
  * 与旧客户端 (重新对接光头强驱动.c) 的 netlink 协议完全兼容:
- *   NETLINK_WUWA=25, CMD_HBP_INSTALL=0x1001, CMD_HBP_CLEANUP=0x1002,
+ *   NETLINK_WUWA=25 (25 被系统占用时自动尝试 26~29),
+ *   CMD_HBP_INSTALL=0x1001, CMD_HBP_CLEANUP=0x1002,
  *   CMD_MEM_READ=0x1003 / CMD_MEM_READ_ACK=0x1004, seed 逐字节异或解密。
  */
 
@@ -93,7 +94,8 @@ static void ghost_exec_free(void *ptr)
 
 MODULE_LICENSE("GPL");
 
-#define NETLINK_WUWA       25
+#define NETLINK_WUWA       25   /* 首选协议号 (与旧客户端兼容) */
+#define NETLINK_WUWA_MAX   29   /* 被占用时逐个尝试到 29 */
 #define CMD_HBP_INSTALL    0x1001
 #define CMD_HBP_CLEANUP    0x1002
 #define CMD_MEM_READ       0x1003
@@ -178,6 +180,7 @@ struct wuwa_mem_req {
  * 全局状态
  * ------------------------------------------------------------------ */
 static struct sock *wuwa_nl_sk;
+static int          wuwa_nl_proto;  /* 实际注册成功的 netlink 协议号 (25~29) */
 
 static int                  g_target_tgid;   /* 目标进程 tgid */
 static struct mm_struct    *g_target_mm;     /* 目标进程 mm (持引用) */
@@ -1055,9 +1058,17 @@ static int __init ghost_core_init(void)
 
     memset(&nl_cfg, 0, sizeof(nl_cfg));
     nl_cfg.input = ghost_nl_recv_msg;
-    wuwa_nl_sk = netlink_kernel_create(&init_net, NETLINK_WUWA, &nl_cfg);
-    if (!wuwa_nl_sk)
+    wuwa_nl_sk = NULL;
+    for (wuwa_nl_proto = NETLINK_WUWA; wuwa_nl_proto <= NETLINK_WUWA_MAX; wuwa_nl_proto++) {
+        wuwa_nl_sk = netlink_kernel_create(&init_net, wuwa_nl_proto, &nl_cfg);
+        if (wuwa_nl_sk)
+            break;
+    }
+    if (!wuwa_nl_sk) {
+        wuwa_nl_proto = 0;
         return -ENOMEM;
+    }
+    pr_info("android_wuwa: netlink proto %d registered\n", wuwa_nl_proto);
 
     INIT_DELAYED_WORK(&g_rearm_work, ghost_rearm_work_fn);
     cloak_module();
