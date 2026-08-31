@@ -1,7 +1,7 @@
 /*
  * =====================================================================================
  *       Filename:  dynamic_resolver.c
- *    Description:  Bypassing GKI KMI Restrictions via Kprobe Extraction
+ *    Description:  Resolve optional kernel symbols at runtime
  *   Architecture:  AArch64
  * =====================================================================================
  */
@@ -34,8 +34,7 @@ int ghost_resolver_init(void)
         return -EINVAL;
     }
 
-    pr_info("[Ghost Resolver] Engine Online. kallsyms_lookup_name extracted at: 0x%lx\n", 
-            (unsigned long)p_kallsyms_lookup_name);
+    pr_info("[Ghost Resolver] Engine online.\n");
 
     return 0;
 }
