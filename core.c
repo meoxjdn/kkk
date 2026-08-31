@@ -622,8 +622,9 @@ static int ghost_dpf_hook(unsigned long addr, unsigned long esr,
 
     if (debug && READ_ONCE(g_fault_log_budget)) {
         WRITE_ONCE(g_fault_log_budget, READ_ONCE(g_fault_log_budget) - 1);
-        pr_info("ghost: fault addr=0x%lx esr=0x%lx pc=0x%lx tid=%d\n",
-                addr, esr, regs->pc, current->pid);
+        pr_info("ghost: fault addr=0x%llx esr=0x%llx pc=0x%llx tid=%d\n",
+                (unsigned long long)addr, (unsigned long long)esr,
+                (unsigned long long)regs->pc, current->pid);
     }
 
     ec = (esr >> 26) & 0x3F;
@@ -638,7 +639,8 @@ static int ghost_dpf_hook(unsigned long addr, unsigned long esr,
         ghost_unarm_page_of(pc);
         ghost_apply(regs, base);
         if (debug)
-            pr_info("ghost: handled pc=0x%lx tid=%d\n", pc, current->pid);
+            pr_info("ghost: handled pc=0x%llx tid=%d\n",
+                    (unsigned long long)pc, current->pid);
         this_cpu_dec(g_fault_depth);
         return 1;
     }
