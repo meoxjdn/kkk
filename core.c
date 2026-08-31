@@ -722,8 +722,12 @@ static int ghost_patch_dpf(void)
     u32 insns[PATCH_INSNS];
     int i, rc;
 
-    if (!dpf || g_dpf_patched)
+    if (!dpf || g_dpf_patched) {
+        if (debug)
+            pr_info("ghost: patch skipped dpf=0x%llx patched=%d\n",
+                    (unsigned long long)dpf, g_dpf_patched);
         return 0;
+    }
 
     /* Preserve a BTI landing pad when present; patch after it. */
     switch (((const u32 *)dpf)[0]) {
@@ -739,15 +743,21 @@ static int ghost_patch_dpf(void)
     g_dpf_patch_addr = patch_addr;
 
     tramp = ghost_locate_tramp();
-    if (!tramp)
+    if (!tramp) {
+        if (debug)
+            pr_info("ghost: trampoline not found\n");
         return -EINVAL;
+    }
 
     for (i = 0; i < PATCH_INSNS; i++)
         g_dpf_orig[i] = ((u32 *)patch_addr)[i];
 
     for (i = 0; i < PATCH_INSNS; i++) {
-        if (ghost_insn_is_pc_relative(g_dpf_orig[i]))
+        if (ghost_insn_is_pc_relative(g_dpf_orig[i])) {
+            if (debug)
+                pr_info("ghost: patch rejected pc-relative prologue\n");
             return -EOPNOTSUPP;
+        }
     }
 
     insns[0] = 0x58000051;
@@ -761,12 +771,18 @@ static int ghost_patch_dpf(void)
             return -ENOMEM;
     }
     rc = ghost_build_orig_run();
-    if (rc)
+    if (rc) {
+        if (debug)
+            pr_info("ghost: trampoline build failed rc=%d\n", rc);
         return rc;
+    }
 
     rc = ghost_text_write(patch_addr, insns, PATCH_INSNS);
-    if (rc)
+    if (rc) {
+        if (debug)
+            pr_info("ghost: text patch failed rc=%d\n", rc);
         return rc;
+    }
 
     g_dpf_patched = true;
     dbg_print("do_page_fault patched at 0x%lx\n", dpf);
@@ -924,6 +940,10 @@ static void ghost_nl_recv_msg(struct sk_buff *skb)
                         ((uint8_t *)&pkt->payload)[i] ^ ((uint8_t *)&pkt->seed)[i % 4];
                 ack.rc = ghost_install(&plain);
                 ack.tid = plain.tid;
+                if (debug)
+                    pr_info("ghost: install tid=%d base=0x%llx rc=%d\n",
+                            plain.tid, (unsigned long long)plain.base_addr,
+                            ack.rc);
                 reply_skb = nlmsg_new(sizeof(ack), GFP_KERNEL);
                 if (reply_skb) {
                     reply_nlh = nlmsg_put(reply_skb, NETLINK_CB(skb).portid,
