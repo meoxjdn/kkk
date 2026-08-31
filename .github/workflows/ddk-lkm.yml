@@ -34,7 +34,17 @@ jobs:
     - name: Compile Kernel Module
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
-        make KDIR=$KERNEL_SRC
+        set +e
+        make KDIR=$KERNEL_SRC 2>&1 | tee /tmp/ghost-make.log
+        MAKE_RC=${PIPESTATUS[0]}
+        if [ "$MAKE_RC" -ne 0 ]; then
+          echo "=== Compiler error summary ==="
+          grep -E 'error:|fatal error:|undefined reference|No rule to make|implicit declaration' /tmp/ghost-make.log | head -n 30 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          exit "$MAKE_RC"
+        fi
+        set -e
         
         mkdir -p /github/workspace/out
         
