@@ -84,6 +84,7 @@ MODULE_LICENSE("GPL");
 #define CMD_MEM_READ_ACK   0x1004
 #define CMD_PING           0x1005   /* 新增 */
 #define CMD_PONG           0x1006   /* 新增 */
+#define CMD_HBP_ACK        0x1007
 
 #define GHOST_MAX_PAGES    8
 #define GHOST_MAX_THREADS  32
@@ -97,6 +98,11 @@ MODULE_LICENSE("GPL");
 
 #ifndef PTE_ADDR_MASK
 #define PTE_ADDR_MASK (~(PAGE_SIZE - 1))
+#endif
+
+/* Android 5.10 exposes TASK_SIZE_64 but not TASK_SIZE_MAX. */
+#ifndef TASK_SIZE_MAX
+#define TASK_SIZE_MAX TASK_SIZE_64
 #endif
 
 #ifndef PTRS_PER_PTE
@@ -150,6 +156,11 @@ struct wuwa_mem_req {
     uint64_t addr;
     uint32_t size;
 };
+
+struct wuwa_hbp_ack {
+    int32_t rc;
+    int32_t tid;
+};
 #pragma pack(pop)
 
 /* ---------- 全局状态 ---------- */
@@ -175,6 +186,7 @@ struct ghost_page_slot {
 static struct ghost_page_slot g_hooked_pages[GHOST_MAX_PAGES];
 
 static unsigned long g_dpf_addr;
+static unsigned long g_dpf_patch_addr;
 static u32           g_dpf_orig[PATCH_INSNS];
 static bool          g_dpf_patched;
 static void         *g_orig_run_buf;
@@ -182,12 +194,17 @@ static void         *g_orig_run_ptr __attribute__((used));
 
 static bool g_patch_live;
 static struct delayed_work g_rearm_work;
+static DEFINE_PER_CPU(unsigned int, g_fault_depth);
+static unsigned int g_fault_log_budget;
 
 /* 运行期解析的内核符号 */
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 typedef int (*patch_text_t)(void *addr, u32 insn);
 typedef int (*patch_text_sync_t)(void *addrs[], u32 insns[], int cnt);
 typedef int (*set_memory_t)(unsigned long addr, int numpages);
+typedef int (*access_process_vm_t)(struct task_struct *task,
+                                   unsigned long addr, void *buf,
+                                   int len, unsigned int gup_flags);
 typedef void (*mmu_notifier_invalidate_t)(struct mm_struct *mm,
                                           unsigned long start,
                                           unsigned long end);
@@ -197,6 +214,7 @@ static patch_text_t           fn_patch_text;
 static patch_text_sync_t      fn_patch_text_sync;
 static set_memory_t           fn_set_memory_rw;
 static set_memory_t           fn_set_memory_ro;
+static access_process_vm_t     fn_access_process_vm;
 static mmu_notifier_invalidate_t fn_mmu_notifier_invalidate;
 
 /* ---------- 模块隐身 + kallsyms 解析 ---------- */
@@ -235,51 +253,19 @@ void __mmu_notifier_arch_invalidate_secondary_tlbs(struct mm_struct *mm,
 static int ghost_read_task_mem(struct task_struct *task, unsigned long uaddr,
                                void *dest, size_t size)
 {
-    struct mm_struct *mm;
-    pgd_t *pgd;
-    p4d_t *p4d;
-    pud_t *pud;
-    pmd_t *pmd;
-    pte_t *pte;
-    void *kaddr;
-    unsigned long pa, pmd_phys;
-    int ret = 0;
+    size_t chunk;
+    int ret;
 
-    mm = get_task_mm(task);
-    if (!mm)
-        return -ESRCH;
+    if (!task || !dest || !size)
+        return -EINVAL;
 
-    mmap_read_lock(mm);
+    /* Let the MM subsystem handle COW, swapped pages and invalid mappings. */
+    chunk = min_t(size_t, size, PAGE_SIZE - (uaddr & ~PAGE_MASK));
+    if (!fn_access_process_vm)
+        return -EOPNOTSUPP;
 
-    pgd = pgd_offset(mm, uaddr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) goto out_unlock;
-
-    p4d = p4d_offset(pgd, uaddr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) goto out_unlock;
-
-    pud = pud_offset(p4d, uaddr);
-    if (pud_none(*pud) || pud_bad(*pud)) goto out_unlock;
-
-    pmd = pmd_offset(pud, uaddr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) goto out_unlock;
-
-    pmd_phys = pmd_val(*pmd) & PTE_ADDR_MASK;
-    pte = (pte_t *)phys_to_virt(pmd_phys) + ((uaddr >> PAGE_SHIFT) & (PTRS_PER_PTE - 1));
-
-    if (pte_none(*pte) || !pte_present(*pte))
-        goto out_unlock;
-
-    pa = (pte_val(*pte) & PHYS_MASK & PTE_ADDR_MASK);
-    kaddr = phys_to_virt(pa) + (uaddr & ~PAGE_MASK);
-
-    ret = min_t(size_t, size, PAGE_SIZE - (uaddr & ~PAGE_MASK));
-    if (ret > 0)
-        memcpy(dest, kaddr, ret);
-
-out_unlock:
-    mmap_read_unlock(mm);
-    mmput(mm);
-    return ret;
+    ret = fn_access_process_vm(task, uaddr, dest, (int)chunk, FOLL_FORCE);
+    return ret > 0 ? ret : -EFAULT;
 }
 
 /* ---------- PTE/PMD 权限操纵 ---------- */
@@ -548,9 +534,9 @@ static void ghost_apply(struct pt_regs *regs, unsigned long base)
 
         if (get_user(flag_val, (uint32_t __user *)target_addr) == 0 &&
             flag_val == 1) {
-            regs->sp -= 0x40;
-            regs->pc += 4;
-            ghost_unarm_page_of(regs->pc);
+            /* The trapped instruction has not executed a prologue yet. */
+            ghost_unarm_page_of(pc);
+            regs->pc = pc + 4;
             return;
         }
 
@@ -574,20 +560,20 @@ static void ghost_apply(struct pt_regs *regs, unsigned long base)
 }
 
 /* ---------- do_page_fault 截获 ---------- */
-static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long far);
+static int ghost_dpf_hook(unsigned long addr, unsigned long esr,
+                          struct pt_regs *regs);
 
 __attribute__((naked, __noinline__, used))
 static void ghost_dpf_tramp(void)
 {
     __asm__ __volatile__(
+        ".inst 0xd503245f\n\t" /* bti c; nop on CPUs without BTI */
         "stp x19, x20, [sp, #-16]!\n\t"
         "stp x21, x30, [sp, #-16]!\n\t"
         "mov x19, x0\n\t"
         "mov x20, x1\n\t"
         "mov x21, x2\n\t"
-        "mov x0, x2\n\t"
-        "mov x1, x20\n\t"
-        "mov x2, x19\n\t"
+        /* do_page_fault ABI: (fault_addr, esr, regs). */
         "bl ghost_dpf_hook\n\t"
         "cbz x0, 1f\n\t"
         "mov x0, xzr\n\t"
@@ -608,38 +594,52 @@ static void ghost_dpf_tramp(void)
 
 static unsigned long ghost_locate_tramp(void)
 {
-    u32 *p = (u32 *)(unsigned long)&ghost_dpf_tramp;
-    int i;
-    for (i = 0; i < 8; i++) {
-        if (p[i] == 0xAA0003F3UL)
-            return (unsigned long)&p[i];
-    }
-    return 0;
+    /* The patch must enter at the prologue so the paired stp/ldp
+     * instructions preserve the caller's callee-saved registers and SP. */
+    return (unsigned long)&ghost_dpf_tramp;
 }
 
-static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long far) __attribute__((used));
-static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long far)
+static int ghost_dpf_hook(unsigned long addr, unsigned long esr,
+                          struct pt_regs *regs) __attribute__((used));
+static int ghost_dpf_hook(unsigned long addr, unsigned long esr,
+                          struct pt_regs *regs)
 {
     unsigned long pc, base;
     unsigned int ec;
     int j;
 
-    (void)far;
+    (void)addr;
     if (unlikely(!regs))
         return 0;
 
-    if (unlikely(!READ_ONCE(g_patch_live)))
+    /* Never recursively process faults caused by our own probing/PTE update. */
+    if (this_cpu_read(g_fault_depth))
         return 0;
+    this_cpu_inc(g_fault_depth);
+
+    if (unlikely(!READ_ONCE(g_patch_live)))
+        goto out;
+
+    if (debug && READ_ONCE(g_fault_log_budget)) {
+        WRITE_ONCE(g_fault_log_budget, READ_ONCE(g_fault_log_budget) - 1);
+        pr_info("ghost: fault addr=0x%lx esr=0x%lx pc=0x%lx tid=%d\n",
+                addr, esr, regs->pc, current->pid);
+    }
 
     ec = (esr >> 26) & 0x3F;
     if (ec != GHOST_EC_IABT_LOW)
-        return 0;
+        goto out;
 
     pc = regs->pc;
     base = READ_ONCE(g_game_base);
 
     if (base && ghost_target_ok() && ghost_is_hook_pc(pc, base)) {
+        /* One-shot disarm prevents an exception storm on the same text page. */
+        ghost_unarm_page_of(pc);
         ghost_apply(regs, base);
+        if (debug)
+            pr_info("ghost: handled pc=0x%lx tid=%d\n", pc, current->pid);
+        this_cpu_dec(g_fault_depth);
         return 1;
     }
 
@@ -656,6 +656,8 @@ static int ghost_dpf_hook(struct pt_regs *regs, unsigned long esr, unsigned long
             }
         }
     }
+out:
+    this_cpu_dec(g_fault_depth);
     return 0;
 }
 
@@ -682,10 +684,12 @@ static int ghost_text_write(unsigned long addr, const u32 *insns, int cnt)
     return -EOPNOTSUPP;
 }
 
+static bool ghost_insn_is_pc_relative(u32 insn);
+
 static int ghost_build_orig_run(void)
 {
     u32 *buf = (u32 *)g_orig_run_buf;
-    unsigned long cont = g_dpf_addr + PATCH_INSNS * 4;
+    unsigned long cont = g_dpf_patch_addr + PATCH_INSNS * 4;
     u8 tmp[32];
     int i;
 
@@ -712,25 +716,37 @@ static int ghost_build_orig_run(void)
 static int ghost_patch_dpf(void)
 {
     unsigned long tramp, dpf = g_dpf_addr;
+    unsigned long patch_addr = dpf;
     u32 insns[PATCH_INSNS];
     int i, rc;
 
     if (!dpf || g_dpf_patched)
         return 0;
 
-    for (i = 0; i < 8; i++) {
-        u32 insn = ((const u32 *)dpf)[i];
-        if (insn == 0xD503241FUL || insn == 0xD503245FUL ||
-            insn == 0xD503249FUL || insn == 0xD50324DFUL)
-            return -EOPNOTSUPP;
+    /* Preserve a BTI landing pad when present; patch after it. */
+    switch (((const u32 *)dpf)[0]) {
+    case 0xD503241FUL: /* bti j */
+    case 0xD503245FUL: /* bti c */
+    case 0xD503249FUL: /* bti jc */
+    case 0xD50324DFUL: /* bti */
+        patch_addr = dpf + 4;
+        break;
+    default:
+        break;
     }
+    g_dpf_patch_addr = patch_addr;
 
     tramp = ghost_locate_tramp();
     if (!tramp)
         return -EINVAL;
 
     for (i = 0; i < PATCH_INSNS; i++)
-        g_dpf_orig[i] = ((u32 *)dpf)[i];
+        g_dpf_orig[i] = ((u32 *)patch_addr)[i];
+
+    for (i = 0; i < PATCH_INSNS; i++) {
+        if (ghost_insn_is_pc_relative(g_dpf_orig[i]))
+            return -EOPNOTSUPP;
+    }
 
     insns[0] = 0x58000051;
     insns[1] = 0xD61F0220;
@@ -746,7 +762,7 @@ static int ghost_patch_dpf(void)
     if (rc)
         return rc;
 
-    rc = ghost_text_write(dpf, insns, PATCH_INSNS);
+    rc = ghost_text_write(patch_addr, insns, PATCH_INSNS);
     if (rc)
         return rc;
 
@@ -760,10 +776,28 @@ static void ghost_unpatch_dpf(void)
     if (!g_dpf_addr || !g_dpf_patched)
         return;
 
-    ghost_text_write(g_dpf_addr, g_dpf_orig, PATCH_INSNS);
-    flush_icache_range(g_dpf_addr, g_dpf_addr + PATCH_INSNS * 4);
+    ghost_text_write(g_dpf_patch_addr, g_dpf_orig, PATCH_INSNS);
+    flush_icache_range(g_dpf_patch_addr,
+                       g_dpf_patch_addr + PATCH_INSNS * 4);
+    g_dpf_patch_addr = 0;
     g_dpf_patched = false;
     dbg_print("do_page_fault restored\n");
+}
+
+static bool ghost_insn_is_pc_relative(u32 insn)
+{
+    if ((insn & 0x9F000000) == 0x10000000) /* adr/adrp */
+        return true;
+    if ((insn & 0xFC000000) == 0x14000000 ||
+        (insn & 0xFC000000) == 0x94000000) /* b/bl */
+        return true;
+    if ((insn & 0xFF000010) == 0x54000000 ||
+        (insn & 0x7E000000) == 0x34000000 ||
+        (insn & 0x7E000000) == 0x36000000) /* b.cond/cbz/tbz */
+        return true;
+    if ((insn & 0x3B000000) == 0x18000000) /* ldr/ldrsw literal */
+        return true;
+    return false;
 }
 
 /* ---------- 安装 / 清理 ---------- */
@@ -776,6 +810,26 @@ static int ghost_install(struct wuwa_hbp_req *req)
     if (!req->border_on && !req->skip_on && !req->damage_on &&
         !req->maxhp_on && !req->fov_on)
         return -EINVAL;
+
+    if (!req->base_addr || req->base_addr >= TASK_SIZE_MAX)
+        return -EINVAL;
+
+    /* Reject wrapped or unaligned control-flow targets. */
+#define VALID_TARGET(off) \
+    ((off) <= (uint64_t)(TASK_SIZE_MAX - req->base_addr) && \
+     (req->base_addr + (off)) < TASK_SIZE_MAX && \
+     !((req->base_addr + (off)) & 3))
+    if ((req->border_on && !VALID_TARGET(req->off_border)) ||
+        (req->skip_on && (!VALID_TARGET(req->off_pause_win) ||
+                          !VALID_TARGET(req->off_pause_jmp))) ||
+        (req->damage_on && !VALID_TARGET(req->off_damage)) ||
+        (req->fov_on && (!VALID_TARGET(req->off_fov) ||
+                         !VALID_TARGET(req->off_fov_gadget))) ||
+        (req->maxhp_on && !VALID_TARGET(req->off_kill))) {
+        #undef VALID_TARGET
+        return -EINVAL;
+    }
+#undef VALID_TARGET
 
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct)
@@ -807,6 +861,7 @@ static int ghost_install(struct wuwa_hbp_req *req)
     rc = ghost_patch_dpf();
     if (!rc) {
         WRITE_ONCE(g_patch_live, true);
+        WRITE_ONCE(g_fault_log_budget, 32);
         rc = ghost_arm_hook_pages();
         if (rc) {
             ghost_restore_all_pages();
@@ -832,8 +887,10 @@ static void ghost_cleanup(void)
     ghost_unpatch_dpf();
 
     g_target_tgid = 0;
-    /* 故意不 mmput 防止 UAF */
-    g_target_mm = NULL;
+    if (g_target_mm) {
+        mmput(g_target_mm);
+        g_target_mm = NULL;
+    }
     WRITE_ONCE(g_game_base, 0);
     memset(&g_cfg, 0, sizeof(g_cfg));
     memset(g_threads, 0, sizeof(g_threads));
@@ -856,11 +913,24 @@ static void ghost_nl_recv_msg(struct sk_buff *skb)
     while (nlmsg_ok(nlh, len)) {
         if (nlh->nlmsg_type == CMD_HBP_INSTALL) {
             if (nlmsg_len(nlh) >= sizeof(struct wuwa_hbp_pkt)) {
+                struct wuwa_hbp_ack ack;
+                struct sk_buff *reply_skb;
+                struct nlmsghdr *reply_nlh;
                 pkt = (struct wuwa_hbp_pkt *)nlmsg_data(nlh);
                 for (i = 0; i < sizeof(plain); i++)
                     ((uint8_t *)&plain)[i] =
                         ((uint8_t *)&pkt->payload)[i] ^ ((uint8_t *)&pkt->seed)[i % 4];
-                ghost_install(&plain);
+                ack.rc = ghost_install(&plain);
+                ack.tid = plain.tid;
+                reply_skb = nlmsg_new(sizeof(ack), GFP_KERNEL);
+                if (reply_skb) {
+                    reply_nlh = nlmsg_put(reply_skb, NETLINK_CB(skb).portid,
+                                          nlh->nlmsg_seq, CMD_HBP_ACK,
+                                          sizeof(ack), 0);
+                    memcpy(nlmsg_data(reply_nlh), &ack, sizeof(ack));
+                    netlink_unicast(wuwa_nl_sk, reply_skb,
+                                    NETLINK_CB(skb).portid, MSG_DONTWAIT);
+                }
             }
         } else if (nlh->nlmsg_type == CMD_HBP_CLEANUP) {
             ghost_cleanup();
@@ -895,7 +965,7 @@ static void ghost_nl_recv_msg(struct sk_buff *skb)
                             dest_buf = (void *)(reply_mreq + 1);
                             bytes_read = ghost_read_task_mem(task, mreq->addr,
                                                              dest_buf, mreq->size);
-                            reply_mreq->size = bytes_read;
+                            reply_mreq->size = bytes_read > 0 ? bytes_read : 0;
                         }
                         put_pid(pid_struct);
                     }
@@ -944,6 +1014,8 @@ static int __init ghost_core_init(void)
     fn_patch_text      = (patch_text_t)ghost_kallsyms("aarch64_insn_patch_text");
     fn_set_memory_rw   = (set_memory_t)ghost_kallsyms("set_memory_rw");
     fn_set_memory_ro   = (set_memory_t)ghost_kallsyms("set_memory_ro");
+    fn_access_process_vm =
+        (access_process_vm_t)ghost_kallsyms("access_process_vm");
 
     if (!g_dpf_addr || (!fn_patch_text_sync && !fn_patch_text) ||
         (!fn_module_alloc && !g_use_execmem))
